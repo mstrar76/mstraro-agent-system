@@ -24,6 +24,17 @@ trap 'rm -f "$LOCK"' EXIT
   df -h / | tail -n 1 || true
   echo
 
+
+
+  echo "-- home audit (higiene) --"
+  echo "Top-level usage:" 
+  du -sh /home/concierge/* 2>/dev/null | sort -h | tail -n 18 || true
+  echo
+
+  echo "Large files in /home/concierge (>=50MB):"
+  find /home/concierge -maxdepth 1 -type f -size +50M -printf "%f	%k KB
+" 2>/dev/null | sort -k2 -n | tail -n 30 || true
+  echo
   echo "-- docker ps --"
   docker ps --format "{{.Names}}\t{{.Status}}" | sort || true
   echo
