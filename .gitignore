@@ -1,0 +1,11 @@
+# secrets
+config/secrets*.env
+config/secrets.env.bak-*
+
+# runtime data
+/data/
+/logs/
+/memories/
+
+# misc
+.DS_Store

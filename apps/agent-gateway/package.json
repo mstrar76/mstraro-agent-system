@@ -1,0 +1,6 @@
+{
+  "name": "agent-gateway",
+  "private": true,
+  "type": "module",
+  "dependencies": {}
+}
