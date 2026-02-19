@@ -40,7 +40,7 @@ function writeJsonAtomic(filePath, value) {
 }
 
 function loadFilesetSnippet() {
-  const wanted = ['BOT-RULES.md', 'DELEGATION.md', 'connectors.md', 'SOUL.md', 'IDENTITY.md', 'MEMORY.md', 'policies.md'];
+  const wanted = ['BOT-RULES.md', 'DELEGATION.md', 'connectors.md', 'SOUL.md', 'IDENTITY.md', 'MEMORY.md', 'policies.md', 'DIRECTORIES.md'];
   const parts = [];
 
   for (const name of wanted) {
