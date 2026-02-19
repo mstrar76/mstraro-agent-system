@@ -76,9 +76,9 @@ open(p,'w').write(json.dumps({'lastNotifiedDate': d}, indent=2))
 PY
 }
 
-with_apt_lock sudo -n apt-get update -qq 9>"$APT_LOCK"
-
 if is_approved >/dev/null 2>&1; then
+  with_apt_lock sudo -n apt-get update -qq 9>"$APT_LOCK"
+
   echo "approved: applying apt-get upgrade"
   with_apt_lock env DEBIAN_FRONTEND=noninteractive sudo -n apt-get upgrade -y 9>"$APT_LOCK"
   rm -f "$approval_file" || true
