@@ -297,6 +297,41 @@ async function handleMessage(message) {
     return;
   }
 
+
+  if (cmd === '/meta') {
+    if (!agentGatewayUrl) {
+      await api('sendMessage', {
+        chat_id: chatId,
+        message_thread_id: threadId || undefined,
+        text: 'agent-gateway não configurado neste gateway.',
+      });
+      return;
+    }
+
+    try {
+      const res = await fetch(`${agentGatewayUrl.replace(/\/$/, '')}/meta`, { method: 'GET' });
+      const data = await res.json().catch(() => null);
+      const model = data?.opencode?.modelDefaultEnv || data?.opencode?.modelConfig || '(unknown)';
+      const img = data?.opencode?.image || '(unknown)';
+      const t = data?.opencode?.timeoutMs || '(unknown)';
+      await api('sendMessage', {
+        chat_id: chatId,
+        message_thread_id: threadId || undefined,
+        text: `META
+- model: ${model}
+- image: ${img}
+- timeoutMs: ${t}`,
+      });
+    } catch (err) {
+      await api('sendMessage', {
+        chat_id: chatId,
+        message_thread_id: threadId || undefined,
+        text: `Erro /meta: ${String(err?.message || err)}`,
+      });
+    }
+    return;
+  }
+
   if (cmd === '/topics') {
     const topicMap = readTopicMap();
     const predefined = Object.keys(config.topics || {});
