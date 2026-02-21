@@ -26,47 +26,8 @@ const BASE_POLICY = [
   '- Ações destrutivas exigem confirmação explícita + checklist + backup.',
 ].join('\n');
 
-function logEvent(type, fields) {
-  try {
-    const safe = fields && typeof fields === 'object' ? fields : {};
-    console.log(JSON.stringify({ ts: new Date().toISOString(), type, ...safe }));
-  } catch {
-    // ignore
-  }
-}
-
 function looksDestructive(text) {
   return /(rm\s+-rf|\bdrop\s+database\b|\bdrop\s+table\b|docker\s+system\s+prune|mkfs\b|wipe|format\s+disk|truncate\s+-s\s+0)/i.test(text);
-}
-
-function looksPlaceholderReply(replyText) {
-  const t = String(replyText || '').trim();
-  if (!t) return false;
-  if (t.length > 420) return false;
-
-  const tl = t.toLowerCase();
-  const startsLikePromise = tl.startsWith('vou') || tl.startsWith('já vou') || tl.startsWith('posso verificar');
-  if (!startsLikePromise) return false;
-
-  const triggers = [
-    'vou verificar',
-    'vou checar',
-    'vou pesquisar',
-    'vou analisar',
-    'vou investigar',
-    'vou configurar',
-    'vou instalar',
-    'vou ver o status',
-    'posso verificar',
-  ];
-
-  const hasTrigger = triggers.some((p) => tl.includes(p));
-  if (!hasTrigger) return false;
-
-  const hasSteps = t.includes('\n-') || t.includes('\n•') || t.includes('\n1.') || t.includes('\n2.');
-  if (hasSteps) return false;
-
-  return true;
 }
 
 function readJson(filePath, fallback) {
@@ -82,12 +43,6 @@ function writeJsonAtomic(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2));
   fs.renameSync(tmpPath, filePath);
-}
-
-function getSessionEntry(chatId, threadId) {
-  const map = readJson(SESSION_MAP_PATH, { sessions: {} });
-  const key = `${chatId}:${threadId}`;
-  return map?.sessions?.[key] || null;
 }
 
 function loadFilesetSnippet() {
@@ -236,50 +191,10 @@ async function handleRespond(res, body) {
   const model = String(body?.model || OPENCODE_MODEL_DEFAULT || '').trim();
   const message = finalPrompt;
 
-  const t0 = Date.now();
-  const first = await runOpencode({ sessionID, title: sessionID ? null : title, model, message });
-  const sid = sessionID || first.sessionID || null;
-  let final = first;
-  let secondPass = false;
+  const result = await runOpencode({ sessionID, title: sessionID ? null : title, model, message });
 
-  if (sid && looksPlaceholderReply(first.text)) {
-    secondPass = true;
-    const followup = [
-      BASE_POLICY,
-      contextPrefix,
-      '# Continuação obrigatória',
-      'Você respondeu com um placeholder (promessa de ação sem entrega).',
-      'Entregue AGORA uma resposta completa e acionável.',
-      '- Se não for possível verificar algo sem acesso/sem evidência, diga explicitamente e explique como obter.',
-      '- Não responda apenas "vou verificar".',
-      '',
-      '# Mensagem original do usuário',
-      userText,
-    ].join('\n');
-
-    const second = await runOpencode({ sessionID: sid, title: null, model, message: followup });
-    if ((second.text || '').trim()) final = second;
-  }
-
-  logEvent('respond', {
-    chatId,
-    threadId,
-    topicKey,
-    ok: final.ok,
-    code: final.code,
-    ms: Date.now() - t0,
-    sessionID_in: sessionID || null,
-    sessionID_out: sid,
-    replyLen: (final.text || '').length,
-    stderrLen: (final.stderr || '').length,
-    model: model || null,
-    secondPass,
-  });
-
-  const result = final;
-
-  if (!sessionID && (sid || result.sessionID)) {
-    sessionID = sid || result.sessionID;
+  if (!sessionID && result.sessionID) {
+    sessionID = result.sessionID;
     map.sessions[key] = { sessionID, topicKey, threadId, chatId, createdAt: new Date().toISOString() };
     writeJsonAtomic(SESSION_MAP_PATH, map);
   }
@@ -307,23 +222,6 @@ const server = http.createServer((req, res) => {
         fileset: { dir: FILESET_DIR },
       }),
     );
-    return;
-  }
-
-  if (req.method === 'GET' && req.url && req.url.startsWith('/session')) {
-    const u = new URL(req.url, 'http://localhost');
-    const chatId = u.searchParams.get('chatId');
-    const threadId = u.searchParams.get('threadId');
-
-    if (!chatId || threadId === null) {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'missing chatId/threadId' }));
-      return;
-    }
-
-    const entry = getSessionEntry(chatId, threadId);
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, key: `${chatId}:${threadId}`, entry }));
     return;
   }
 

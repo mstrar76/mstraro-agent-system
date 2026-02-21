@@ -42,12 +42,9 @@ function looksDestructive(text) {
 function looksPlaceholderReply(replyText) {
   const t = String(replyText || '').trim();
   if (!t) return false;
-  if (t.length > 420) return false;
+  if (t.length > 380) return false;
 
   const tl = t.toLowerCase();
-  const startsLikePromise = tl.startsWith('vou') || tl.startsWith('já vou') || tl.startsWith('posso verificar');
-  if (!startsLikePromise) return false;
-
   const triggers = [
     'vou verificar',
     'vou checar',

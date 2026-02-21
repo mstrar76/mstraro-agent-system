@@ -42,32 +42,22 @@ function looksDestructive(text) {
 function looksPlaceholderReply(replyText) {
   const t = String(replyText || '').trim();
   if (!t) return false;
-  if (t.length > 420) return false;
 
-  const tl = t.toLowerCase();
-  const startsLikePromise = tl.startsWith('vou') || tl.startsWith('já vou') || tl.startsWith('posso verificar');
-  if (!startsLikePromise) return false;
+  // Heurística: respostas curtas que prometem ação futura sem entregar conteúdo.
+  if (t.length > 320) return false;
 
-  const triggers = [
-    'vou verificar',
-    'vou checar',
-    'vou pesquisar',
-    'vou analisar',
-    'vou investigar',
-    'vou configurar',
-    'vou instalar',
-    'vou ver o status',
-    'posso verificar',
-  ];
+  const futureVerb = /(vou|irei|já\s+vou|posso\s+verificar|vou\s+(verificar|checar|pesquisar|analisar|investigar|configurar|instalar))/i;
+  if (!futureVerb.test(t)) return false;
 
-  const hasTrigger = triggers.some((p) => tl.includes(p));
-  if (!hasTrigger) return false;
-
-  const hasSteps = t.includes('\n-') || t.includes('\n•') || t.includes('\n1.') || t.includes('\n2.');
-  if (hasSteps) return false;
+  // Se já tem estrutura de passos, não tratar como placeholder.
+  if (/
+\s*[-*]\s+/.test(t)) return false;
+  if (/
+\s*\d+\./.test(t)) return false;
 
   return true;
 }
+
 
 function readJson(filePath, fallback) {
   try {
@@ -233,29 +223,31 @@ async function handleRespond(res, body) {
   // fileset is only included on first message to reduce token usage.
   // sessions remain isolated by (chatId, threadId) mapping.
 
+
   const model = String(body?.model || OPENCODE_MODEL_DEFAULT || '').trim();
   const message = finalPrompt;
 
   const t0 = Date.now();
   const first = await runOpencode({ sessionID, title: sessionID ? null : title, model, message });
+
   const sid = sessionID || first.sessionID || null;
   let final = first;
-  let secondPass = false;
 
+  // Se a resposta veio como placeholder, força uma continuação imediata (mesma sessão).
   if (sid && looksPlaceholderReply(first.text)) {
-    secondPass = true;
     const followup = [
       BASE_POLICY,
       contextPrefix,
       '# Continuação obrigatória',
-      'Você respondeu com um placeholder (promessa de ação sem entrega).',
+      'Sua resposta anterior foi um placeholder (promessa de ação sem entrega).',
       'Entregue AGORA uma resposta completa e acionável.',
-      '- Se não for possível verificar algo sem acesso/sem evidência, diga explicitamente e explique como obter.',
-      '- Não responda apenas "vou verificar".',
+      '- Se você não consegue verificar algo (sem acesso/sem evidência), diga explicitamente e explique como obter.',
+      '- Não diga apenas "vou verificar"; finalize nesta mensagem.',
       '',
       '# Mensagem original do usuário',
       userText,
-    ].join('\n');
+    ].join('
+');
 
     const second = await runOpencode({ sessionID: sid, title: null, model, message: followup });
     if ((second.text || '').trim()) final = second;
@@ -273,13 +265,13 @@ async function handleRespond(res, body) {
     replyLen: (final.text || '').length,
     stderrLen: (final.stderr || '').length,
     model: model || null,
-    secondPass,
+    secondPass: sid && looksPlaceholderReply(first.text) ? true : false,
   });
 
   const result = final;
 
-  if (!sessionID && (sid || result.sessionID)) {
-    sessionID = sid || result.sessionID;
+  if (!sessionID && result.sessionID) {
+    sessionID = result.sessionID;
     map.sessions[key] = { sessionID, topicKey, threadId, chatId, createdAt: new Date().toISOString() };
     writeJsonAtomic(SESSION_MAP_PATH, map);
   }

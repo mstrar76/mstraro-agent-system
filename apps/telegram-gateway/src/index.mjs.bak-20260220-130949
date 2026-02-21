@@ -13,8 +13,6 @@ const sessionsDir = process.env.TELEGRAM_SESSIONS_DIR || '/data/sessions';
 const topicMapPath = process.env.TELEGRAM_TOPIC_MAP_PATH || '/data/topic-map.json';
 const approvalsDir = process.env.TELEGRAM_APPROVALS_DIR || '/data/approvals';
 const agentGatewayUrl = process.env.AGENT_GATEWAY_URL || '';
-const AGENT_GATEWAY_TIMEOUT_MS = Number(process.env.AGENT_GATEWAY_TIMEOUT_MS || 120000);
-const TELEGRAM_MESSAGE_MAX = Number(process.env.TELEGRAM_MESSAGE_MAX || 3500);
 
 function readJson(filePath, fallback) {
   try {
@@ -44,42 +42,6 @@ ensureDir(path.dirname(offsetPath));
 ensureDir(sessionsDir);
 ensureDir(approvalsDir);
 
-const MAX_PARALLEL = Number(process.env.MAX_PARALLEL || 2);
-let activeCount = 0;
-const globalQueue = [];
-const inflightByTopic = new Map();
-
-function runLimited(fn) {
-  return new Promise((resolve) => {
-    globalQueue.push({ fn, resolve });
-    drain();
-  });
-}
-
-function drain() {
-  while (activeCount < MAX_PARALLEL && globalQueue.length) {
-    const { fn, resolve } = globalQueue.shift();
-    activeCount += 1;
-    Promise.resolve()
-      .then(fn)
-      .catch(() => {})
-      .finally(() => {
-        activeCount -= 1;
-        drain();
-        resolve();
-      });
-  }
-}
-
-function enqueueTopicWork(topicKey, fn) {
-  const prev = inflightByTopic.get(topicKey) || Promise.resolve();
-  const next = prev.finally(() => runLimited(fn));
-  inflightByTopic.set(topicKey, next);
-  next.finally(() => {
-    if (inflightByTopic.get(topicKey) === next) inflightByTopic.delete(topicKey);
-  });
-}
-
 let offsetState = readJson(offsetPath, { offset: 0 });
 if (typeof offsetState.offset !== 'number') offsetState.offset = 0;
 
@@ -101,91 +63,17 @@ async function api(method, payload) {
 
 async function callAgentGateway(payload) {
   if (!agentGatewayUrl) return null;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('agent-gateway timeout')), AGENT_GATEWAY_TIMEOUT_MS);
-
-  try {
-    const res = await fetch(`${agentGatewayUrl.replace(/\/$/, '')}/respond`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-
-    const data = await res.json().catch(() => null);
-    if (!res.ok) {
-      throw new Error(`agent-gateway http ${res.status}`);
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
+  const res = await fetch(`${agentGatewayUrl.replace(/\/$/, '')}/respond`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(`agent-gateway http ${res.status}`);
   }
+  return data;
 }
-
-function logEvent(type, fields) {
-  try {
-    const safe = fields && typeof fields === 'object' ? fields : {};
-    console.log(JSON.stringify({ ts: new Date().toISOString(), type, ...safe }));
-  } catch {
-    // ignore
-  }
-}
-
-function chunkText(text, maxLen) {
-  const s = String(text || '').trim();
-  if (!s) return [];
-  if (s.length <= maxLen) return [s];
-
-  const NL = String.fromCharCode(10);
-  const SEP = NL + NL;
-  const parts = s.split(SEP);
-  const out = [];
-  let buf = '';
-
-  function flush() {
-    if (!buf) return;
-    out.push(buf);
-    buf = '';
-  }
-
-  for (const p of parts) {
-    const piece = String(p || '').trim();
-    if (!piece) continue;
-
-    const candidate = buf ? (buf + SEP + piece) : piece;
-    if (candidate.length <= maxLen) {
-      buf = candidate;
-      continue;
-    }
-
-    flush();
-    if (piece.length <= maxLen) {
-      buf = piece;
-      continue;
-    }
-
-    for (let i = 0; i < piece.length; i += maxLen) {
-      out.push(piece.slice(i, i + maxLen));
-    }
-  }
-
-  flush();
-  return out;
-}
-
-async function sendText(chatId, threadId, text) {
-  const chunks = chunkText(text, TELEGRAM_MESSAGE_MAX);
-  for (const chunk of chunks) {
-    await api('sendMessage', {
-      chat_id: chatId,
-      message_thread_id: threadId || undefined,
-      text: chunk,
-    });
-    await new Promise((r) => setTimeout(r, 200));
-  }
-}
-
 
 function resolveTopicKey(input) {
   const topics = config.topics || {};
@@ -240,35 +128,6 @@ function appendSessionLog(threadId, record) {
   const line = JSON.stringify(record);
   fs.appendFileSync(sessionLogPath(threadId), `${line}\n`);
 }
-
-async function forwardWork({ chatId, threadId, topicKey, from, text }) {
-  const t0 = Date.now();
-  logEvent('forward_start', { threadId, topicKey, textLen: text.length });
-
-  const progressTimer = setTimeout(() => {
-    void sendText(chatId, threadId, '⌛ Ainda processando…');
-  }, 8000);
-
-  try {
-    const result = await callAgentGateway({
-      chatId,
-      threadId,
-      topicKey,
-      from,
-      text,
-    });
-
-    clearTimeout(progressTimer);
-    const reply = (result?.reply || '').trim();
-    logEvent('forward_done', { threadId, topicKey, ms: Date.now() - t0, ok: !!result?.ok, replyLen: reply.length });
-    if (reply) await sendText(chatId, threadId, reply);
-  } catch (err) {
-    clearTimeout(progressTimer);
-    logEvent('forward_error', { threadId, topicKey, ms: Date.now() - t0, err: String(err?.message || err) });
-    await sendText(chatId, threadId, `Erro no agent-gateway: ${String(err?.message || err)}`);
-  }
-}
-
 
 async function handleMessage(message) {
   const chatId = message?.chat?.id;
@@ -449,29 +308,6 @@ async function handleMessage(message) {
       return;
     }
 
-
-  if (cmd === '/session') {
-    if (!agentGatewayUrl) {
-      await sendText(chatId, threadId, 'agent-gateway não configurado neste gateway.');
-      return;
-    }
-
-    try {
-      const base = agentGatewayUrl.replace(/\/$/, '');
-      const url = `${base}/session?chatId=${encodeURIComponent(String(chatId))}&threadId=${encodeURIComponent(String(threadId))}`;
-      const res = await fetch(url, { method: 'GET' });
-      const data = await res.json().catch(() => null);
-      const sid = data?.entry?.sessionID || '(none)';
-      await sendText(chatId, threadId, `SESSION
-- topic: ${topicKey}
-- threadId: ${threadId}
-- sessionID: ${sid}`);
-    } catch (err) {
-      await sendText(chatId, threadId, `Erro /session: ${String(err?.message || err)}`);
-    }
-    return;
-  }
-
     try {
       const res = await fetch(`${agentGatewayUrl.replace(/\/$/, '')}/meta`, { method: 'GET' });
       const data = await res.json().catch(() => null);
@@ -535,84 +371,33 @@ async function handleMessage(message) {
     return;
   }
 
-  
-  if (cmd === '/retry') {
-    const p = sessionLogPath(threadId);
-    let last = null;
-    try {
-      const raw = fs.readFileSync(p, 'utf8');
-      const lines = raw.trim().split(String.fromCharCode(10)).slice(-200);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const rec = JSON.parse(lines[i]);
-          const t = String(rec?.text || '').trim();
-          if (!t) continue;
-          if (t.startsWith('/')) continue;
-          last = t;
-          break;
-        } catch {}
-      }
-    } catch {}
-
-    if (!last) {
-      await sendText(chatId, threadId, 'Nada para repetir neste tópico ainda.');
-      return;
-    }
-
-    await sendText(chatId, threadId, '↻ Reexecutando sua última mensagem…');
-
-    // Re-invoke by falling through into the forward path using the same text
-    // (override current command text)
-    const overrideText = last;
-
-    // inline forward (duplicated to keep control flow simple)
-    const t0 = Date.now();
-    logEvent('retry_start', { threadId, topicKey, textLen: overrideText.length });
-
-    const progressTimer = setTimeout(() => {
-      void sendText(chatId, threadId, '⌛ Ainda processando…');
-    }, 8000);
-
+  // default: forward to agent-gateway (LLM responder) if configured
+  if (agentGatewayUrl) {
     try {
       const result = await callAgentGateway({
         chatId,
         threadId,
         topicKey,
         from: { id: from.id, username: from.username },
-        text: overrideText,
-      });
-
-      clearTimeout(progressTimer);
-      clearTimeout(progressTimer);
-      const reply = (result?.reply || '').trim();
-      logEvent('retry_done', { threadId, topicKey, ms: Date.now() - t0, ok: !!result?.ok, replyLen: reply.length });
-      if (reply) await sendText(chatId, threadId, reply);
-    } catch (err) {
-      clearTimeout(progressTimer);
-      logEvent('retry_error', { threadId, topicKey, ms: Date.now() - t0, err: String(err?.message || err) });
-      await sendText(chatId, threadId, `Erro no agent-gateway: ${String(err?.message || err)}`);
-    }
-
-    return;
-  }
-
-    // default: forward to agent-gateway (LLM responder) if configured
-  if (agentGatewayUrl) {
-    const queueKey = `${chatId}:${threadId}`;
-    // Confirma recebimento imediatamente para não deixar no vácuo.
-    void sendText(chatId, threadId, '✅ Recebido. Vou responder aqui neste tópico.');
-
-    enqueueTopicWork(queueKey, async () => {
-      await forwardWork({
-        chatId,
-        threadId,
-        topicKey,
-        from: { id: from.id, username: from.username },
         text,
       });
-    });
-  }
 
+      const reply = (result?.reply || '').trim();
+      if (reply) {
+        await api('sendMessage', {
+          chat_id: chatId,
+          message_thread_id: threadId || undefined,
+          text: reply,
+        });
+      }
+    } catch (err) {
+      await api('sendMessage', {
+        chat_id: chatId,
+        message_thread_id: threadId || undefined,
+        text: `Erro no agent-gateway: ${String(err?.message || err)}`,
+      });
+    }
+  }
 }
 
 async function pollForever() {
@@ -630,7 +415,7 @@ async function pollForever() {
       if (Array.isArray(updates) && updates.length) {
         for (const u of updates) {
           offsetState.offset = Math.max(offsetState.offset, u.update_id + 1);
-          if (u.message) void handleMessage(u.message);
+          if (u.message) await handleMessage(u.message);
         }
         writeJsonAtomic(offsetPath, offsetState);
       }

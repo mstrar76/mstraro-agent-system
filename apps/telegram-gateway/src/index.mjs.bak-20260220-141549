@@ -44,42 +44,6 @@ ensureDir(path.dirname(offsetPath));
 ensureDir(sessionsDir);
 ensureDir(approvalsDir);
 
-const MAX_PARALLEL = Number(process.env.MAX_PARALLEL || 2);
-let activeCount = 0;
-const globalQueue = [];
-const inflightByTopic = new Map();
-
-function runLimited(fn) {
-  return new Promise((resolve) => {
-    globalQueue.push({ fn, resolve });
-    drain();
-  });
-}
-
-function drain() {
-  while (activeCount < MAX_PARALLEL && globalQueue.length) {
-    const { fn, resolve } = globalQueue.shift();
-    activeCount += 1;
-    Promise.resolve()
-      .then(fn)
-      .catch(() => {})
-      .finally(() => {
-        activeCount -= 1;
-        drain();
-        resolve();
-      });
-  }
-}
-
-function enqueueTopicWork(topicKey, fn) {
-  const prev = inflightByTopic.get(topicKey) || Promise.resolve();
-  const next = prev.finally(() => runLimited(fn));
-  inflightByTopic.set(topicKey, next);
-  next.finally(() => {
-    if (inflightByTopic.get(topicKey) === next) inflightByTopic.delete(topicKey);
-  });
-}
-
 let offsetState = readJson(offsetPath, { offset: 0 });
 if (typeof offsetState.offset !== 'number') offsetState.offset = 0;
 
@@ -240,35 +204,6 @@ function appendSessionLog(threadId, record) {
   const line = JSON.stringify(record);
   fs.appendFileSync(sessionLogPath(threadId), `${line}\n`);
 }
-
-async function forwardWork({ chatId, threadId, topicKey, from, text }) {
-  const t0 = Date.now();
-  logEvent('forward_start', { threadId, topicKey, textLen: text.length });
-
-  const progressTimer = setTimeout(() => {
-    void sendText(chatId, threadId, '⌛ Ainda processando…');
-  }, 8000);
-
-  try {
-    const result = await callAgentGateway({
-      chatId,
-      threadId,
-      topicKey,
-      from,
-      text,
-    });
-
-    clearTimeout(progressTimer);
-    const reply = (result?.reply || '').trim();
-    logEvent('forward_done', { threadId, topicKey, ms: Date.now() - t0, ok: !!result?.ok, replyLen: reply.length });
-    if (reply) await sendText(chatId, threadId, reply);
-  } catch (err) {
-    clearTimeout(progressTimer);
-    logEvent('forward_error', { threadId, topicKey, ms: Date.now() - t0, err: String(err?.message || err) });
-    await sendText(chatId, threadId, `Erro no agent-gateway: ${String(err?.message || err)}`);
-  }
-}
-
 
 async function handleMessage(message) {
   const chatId = message?.chat?.id;
@@ -541,7 +476,8 @@ async function handleMessage(message) {
     let last = null;
     try {
       const raw = fs.readFileSync(p, 'utf8');
-      const lines = raw.trim().split(String.fromCharCode(10)).slice(-200);
+      const normalized = raw.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+      const lines = normalized.trim().split('\n').slice(-200);
       for (let i = lines.length - 1; i >= 0; i--) {
         try {
           const rec = JSON.parse(lines[i]);
@@ -596,23 +532,32 @@ async function handleMessage(message) {
     return;
   }
 
-    // default: forward to agent-gateway (LLM responder) if configured
+  // default: forward to agent-gateway (LLM responder) if configured
   if (agentGatewayUrl) {
-    const queueKey = `${chatId}:${threadId}`;
-    // Confirma recebimento imediatamente para não deixar no vácuo.
-    void sendText(chatId, threadId, '✅ Recebido. Vou responder aqui neste tópico.');
+    const t0 = Date.now();
+    logEvent('forward_start', { threadId, topicKey, textLen: text.length });
+    const progressTimer = setTimeout(() => {
+      void sendText(chatId, threadId, '⌛ Ainda processando…');
+    }, 8000);
 
-    enqueueTopicWork(queueKey, async () => {
-      await forwardWork({
+    try {
+      const result = await callAgentGateway({
         chatId,
         threadId,
         topicKey,
         from: { id: from.id, username: from.username },
         text,
       });
-    });
-  }
 
+      const reply = (result?.reply || '').trim();
+      logEvent('forward_done', { threadId, topicKey, ms: Date.now() - t0, ok: !!result?.ok, replyLen: reply.length });
+      if (reply) await sendText(chatId, threadId, reply);
+    } catch (err) {
+      clearTimeout(progressTimer);
+      logEvent('forward_error', { threadId, topicKey, ms: Date.now() - t0, err: String(err?.message || err) });
+      await sendText(chatId, threadId, `Erro no agent-gateway: ${String(err?.message || err)}`);
+    }
+  }
 }
 
 async function pollForever() {
@@ -630,7 +575,7 @@ async function pollForever() {
       if (Array.isArray(updates) && updates.length) {
         for (const u of updates) {
           offsetState.offset = Math.max(offsetState.offset, u.update_id + 1);
-          if (u.message) void handleMessage(u.message);
+          if (u.message) await handleMessage(u.message);
         }
         writeJsonAtomic(offsetPath, offsetState);
       }

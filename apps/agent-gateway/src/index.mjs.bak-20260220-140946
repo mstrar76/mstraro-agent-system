@@ -39,36 +39,6 @@ function looksDestructive(text) {
   return /(rm\s+-rf|\bdrop\s+database\b|\bdrop\s+table\b|docker\s+system\s+prune|mkfs\b|wipe|format\s+disk|truncate\s+-s\s+0)/i.test(text);
 }
 
-function looksPlaceholderReply(replyText) {
-  const t = String(replyText || '').trim();
-  if (!t) return false;
-  if (t.length > 420) return false;
-
-  const tl = t.toLowerCase();
-  const startsLikePromise = tl.startsWith('vou') || tl.startsWith('já vou') || tl.startsWith('posso verificar');
-  if (!startsLikePromise) return false;
-
-  const triggers = [
-    'vou verificar',
-    'vou checar',
-    'vou pesquisar',
-    'vou analisar',
-    'vou investigar',
-    'vou configurar',
-    'vou instalar',
-    'vou ver o status',
-    'posso verificar',
-  ];
-
-  const hasTrigger = triggers.some((p) => tl.includes(p));
-  if (!hasTrigger) return false;
-
-  const hasSteps = t.includes('\n-') || t.includes('\n•') || t.includes('\n1.') || t.includes('\n2.');
-  if (hasSteps) return false;
-
-  return true;
-}
-
 function readJson(filePath, fallback) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -237,49 +207,23 @@ async function handleRespond(res, body) {
   const message = finalPrompt;
 
   const t0 = Date.now();
-  const first = await runOpencode({ sessionID, title: sessionID ? null : title, model, message });
-  const sid = sessionID || first.sessionID || null;
-  let final = first;
-  let secondPass = false;
-
-  if (sid && looksPlaceholderReply(first.text)) {
-    secondPass = true;
-    const followup = [
-      BASE_POLICY,
-      contextPrefix,
-      '# Continuação obrigatória',
-      'Você respondeu com um placeholder (promessa de ação sem entrega).',
-      'Entregue AGORA uma resposta completa e acionável.',
-      '- Se não for possível verificar algo sem acesso/sem evidência, diga explicitamente e explique como obter.',
-      '- Não responda apenas "vou verificar".',
-      '',
-      '# Mensagem original do usuário',
-      userText,
-    ].join('\n');
-
-    const second = await runOpencode({ sessionID: sid, title: null, model, message: followup });
-    if ((second.text || '').trim()) final = second;
-  }
-
+  const result = await runOpencode({ sessionID, title: sessionID ? null : title, model, message });
   logEvent('respond', {
     chatId,
     threadId,
     topicKey,
-    ok: final.ok,
-    code: final.code,
+    ok: result.ok,
+    code: result.code,
     ms: Date.now() - t0,
     sessionID_in: sessionID || null,
-    sessionID_out: sid,
-    replyLen: (final.text || '').length,
-    stderrLen: (final.stderr || '').length,
+    sessionID_out: result.sessionID || null,
+    replyLen: (result.text || '').length,
+    stderrLen: (result.stderr || '').length,
     model: model || null,
-    secondPass,
   });
 
-  const result = final;
-
-  if (!sessionID && (sid || result.sessionID)) {
-    sessionID = sid || result.sessionID;
+  if (!sessionID && result.sessionID) {
+    sessionID = result.sessionID;
     map.sessions[key] = { sessionID, topicKey, threadId, chatId, createdAt: new Date().toISOString() };
     writeJsonAtomic(SESSION_MAP_PATH, map);
   }
