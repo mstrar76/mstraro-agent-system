@@ -57,6 +57,7 @@ snapshot_repo() {
 
 main() {
   snapshot_repo /home/concierge/agent-system agent-system
+  snapshot_repo /home/concierge/agent-system/data/athena/workspace athena-private
   snapshot_repo /home/concierge/apps apps
   echo "[$(date -Is)] git-snapshot done"
 }
