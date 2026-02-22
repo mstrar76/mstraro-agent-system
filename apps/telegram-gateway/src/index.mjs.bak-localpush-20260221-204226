@@ -123,28 +123,6 @@ async function callAgentGateway(payload) {
   }
 }
 
-async function callAgentGatewayGet(pathname) {
-  if (!agentGatewayUrl) return null;
-  const base = agentGatewayUrl.replace(/\/$/, '');
-  const res = await fetch(`${base}${pathname}`, { method: 'GET' });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`agent-gateway http ${res.status}`);
-  return data;
-}
-
-async function callAgentGatewayPost(pathname, payload) {
-  if (!agentGatewayUrl) return null;
-  const base = agentGatewayUrl.replace(/\/$/, '');
-  const res = await fetch(`${base}${pathname}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload || {}),
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`agent-gateway http ${res.status}`);
-  return data;
-}
-
 function logEvent(type, fields) {
   try {
     const safe = fields && typeof fields === 'object' ? fields : {};
@@ -471,15 +449,42 @@ async function handleMessage(message) {
       return;
     }
 
+
+  if (cmd === '/session') {
+    if (!agentGatewayUrl) {
+      await sendText(chatId, threadId, 'agent-gateway não configurado neste gateway.');
+      return;
+    }
+
     try {
-      const data = await callAgentGatewayGet('/meta');
+      const base = agentGatewayUrl.replace(/\/$/, '');
+      const url = `${base}/session?chatId=${encodeURIComponent(String(chatId))}&threadId=${encodeURIComponent(String(threadId))}`;
+      const res = await fetch(url, { method: 'GET' });
+      const data = await res.json().catch(() => null);
+      const sid = data?.entry?.sessionID || '(none)';
+      await sendText(chatId, threadId, `SESSION
+- topic: ${topicKey}
+- threadId: ${threadId}
+- sessionID: ${sid}`);
+    } catch (err) {
+      await sendText(chatId, threadId, `Erro /session: ${String(err?.message || err)}`);
+    }
+    return;
+  }
+
+    try {
+      const res = await fetch(`${agentGatewayUrl.replace(/\/$/, '')}/meta`, { method: 'GET' });
+      const data = await res.json().catch(() => null);
       const model = data?.opencode?.modelDefaultEnv || data?.opencode?.modelConfig || '(unknown)';
       const img = data?.opencode?.image || '(unknown)';
       const t = data?.opencode?.timeoutMs || '(unknown)';
       await api('sendMessage', {
         chat_id: chatId,
         message_thread_id: threadId || undefined,
-        text: `META\n- model: ${model}\n- image: ${img}\n- timeoutMs: ${t}`,
+        text: `META
+- model: ${model}
+- image: ${img}
+- timeoutMs: ${t}`,
       });
     } catch (err) {
       await api('sendMessage', {
@@ -487,88 +492,6 @@ async function handleMessage(message) {
         message_thread_id: threadId || undefined,
         text: `Erro /meta: ${String(err?.message || err)}`,
       });
-    }
-    return;
-  }
-
-  // Session management (OpenCode session per topic)
-  if (cmd === '/session' || cmd === '/sessions') {
-    if (!agentGatewayUrl) {
-      await sendText(chatId, threadId, 'agent-gateway não configurado neste gateway.');
-      return;
-    }
-
-    const sub = (args[0] || '').trim();
-
-    // /sessions all
-    if (cmd === '/sessions' && sub === 'all') {
-      try {
-        const data = await callAgentGatewayGet(`/sessions?chatId=${encodeURIComponent(String(chatId))}`);
-        const sessions = data?.sessions && typeof data.sessions === 'object' ? data.sessions : {};
-        const keys = Object.keys(sessions).sort((a, b) => a.localeCompare(b));
-        const lines = keys.slice(0, 60).map((k) => {
-          const e = sessions[k] || {};
-          const histCount = Array.isArray(e.history) ? e.history.length : 0;
-          return `${k} topic=${e.topicKey || '?'} session=${e.sessionID || '(none)'} hist=${histCount}`;
-        });
-        await sendText(chatId, threadId, lines.length ? `SESSIONS (chat ${chatId})\n${lines.join('\n')}` : 'Nenhuma sessão registrada ainda.');
-      } catch (err) {
-        await sendText(chatId, threadId, `Erro /sessions all: ${String(err?.message || err)}`);
-      }
-      return;
-    }
-
-    // /session new
-    if (cmd === '/session' && sub === 'new') {
-      try {
-        const data = await callAgentGatewayPost('/session/new', {
-          chatId,
-          threadId,
-          topicKey,
-          from: { id: from.id, username: from.username },
-        });
-        const sid = data?.sessionID || data?.entry?.sessionID || '(unknown)';
-        await sendText(chatId, threadId, `OK. Nova sessão criada e ativada.\n- topic: ${topicKey}\n- threadId: ${threadId}\n- sessionID: ${sid}`);
-      } catch (err) {
-        await sendText(chatId, threadId, `Erro /session new: ${String(err?.message || err)}`);
-      }
-      return;
-    }
-
-    // /session use <id>
-    if (cmd === '/session' && sub === 'use') {
-      const sid = String(args[1] || '').trim();
-      if (!sid) {
-        await sendText(chatId, threadId, 'Uso: /session use <sessionID>');
-        return;
-      }
-      try {
-        await callAgentGatewayPost('/session/set', { chatId, threadId, topicKey, sessionID: sid });
-        await sendText(chatId, threadId, `OK. Sessão ativa atualizada.\n- sessionID: ${sid}`);
-      } catch (err) {
-        await sendText(chatId, threadId, `Erro /session use: ${String(err?.message || err)}`);
-      }
-      return;
-    }
-
-    // Default: show current (and history if available)
-    try {
-      const data = await callAgentGatewayGet(
-        `/session?chatId=${encodeURIComponent(String(chatId))}&threadId=${encodeURIComponent(String(threadId))}`,
-      );
-      const entry = data?.entry || {};
-      const sid = entry?.sessionID || '(none)';
-      const history = Array.isArray(entry?.history) ? entry.history : [];
-      const histLines = history.slice(0, 8).map((h, i) => `  ${i === 0 ? '*' : '-'} ${h}`).join('\n');
-      await sendText(
-        chatId,
-        threadId,
-        `SESSION\n- topic: ${topicKey}\n- threadId: ${threadId}\n- sessionID: ${sid}${
-          history.length ? `\n- history (${history.length}):\n${histLines}` : ''
-        }\n\nComandos:\n- /session new\n- /session use <sessionID>\n- /sessions all`,
-      );
-    } catch (err) {
-      await sendText(chatId, threadId, `Erro /session: ${String(err?.message || err)}`);
     }
     return;
   }
@@ -659,6 +582,7 @@ async function handleMessage(message) {
         text: overrideText,
       });
 
+      clearTimeout(progressTimer);
       clearTimeout(progressTimer);
       const reply = (result?.reply || '').trim();
       logEvent('retry_done', { threadId, topicKey, ms: Date.now() - t0, ok: !!result?.ok, replyLen: reply.length });

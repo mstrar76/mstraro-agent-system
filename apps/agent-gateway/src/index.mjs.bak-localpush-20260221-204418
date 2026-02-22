@@ -190,8 +190,6 @@ function runOpencode({ sessionID, title, model, message }) {
       '-v',
       '/home/concierge/agent-system/data/opencode/state:/root/.local/state/opencode',
       '-v',
-      '/home/concierge/agent-system/data/opencode/home:/root/.opencode',
-      '-v',
       '/home/concierge/agent-system/data/opencode/workspace:/workspace',
       '-w',
       OPENCODE_WORKDIR,
@@ -480,7 +478,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && req.url && (req.url === '/session' || req.url.startsWith('/session?'))) {
+  if (req.method === 'GET' && req.url && req.url.startsWith('/session')) {
     const u = new URL(req.url, 'http://localhost');
     const chatId = u.searchParams.get('chatId');
     const threadId = u.searchParams.get('threadId');

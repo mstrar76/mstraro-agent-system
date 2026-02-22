@@ -90,32 +90,6 @@ function getSessionEntry(chatId, threadId) {
   return map?.sessions?.[key] || null;
 }
 
-function listSessionEntries({ chatId } = {}) {
-  const map = readJson(SESSION_MAP_PATH, { sessions: {} });
-  const sessions = map?.sessions && typeof map.sessions === 'object' ? map.sessions : {};
-  const out = {};
-
-  for (const [key, value] of Object.entries(sessions)) {
-    if (!chatId) {
-      out[key] = value;
-      continue;
-    }
-    if (String(key).startsWith(`${chatId}:`)) out[key] = value;
-  }
-  return out;
-}
-
-function upsertSessionEntry(chatId, threadId, updater) {
-  const map = readJson(SESSION_MAP_PATH, { sessions: {} });
-  if (!map.sessions || typeof map.sessions !== 'object') map.sessions = {};
-  const key = `${chatId}:${threadId}`;
-  const prev = map.sessions[key] || null;
-  const next = updater(prev);
-  map.sessions[key] = next;
-  writeJsonAtomic(SESSION_MAP_PATH, map);
-  return { key, entry: next };
-}
-
 function loadFilesetSnippet() {
   const wanted = ['BOT-RULES.md', 'DELEGATION.md', 'connectors.md', 'SOUL.md', 'IDENTITY.md', 'MEMORY.md', 'policies.md', 'DIRECTORIES.md'];
   const parts = [];
@@ -190,8 +164,6 @@ function runOpencode({ sessionID, title, model, message }) {
       '-v',
       '/home/concierge/agent-system/data/opencode/state:/root/.local/state/opencode',
       '-v',
-      '/home/concierge/agent-system/data/opencode/home:/root/.opencode',
-      '-v',
       '/home/concierge/agent-system/data/opencode/workspace:/workspace',
       '-w',
       OPENCODE_WORKDIR,
@@ -215,134 +187,6 @@ function runOpencode({ sessionID, title, model, message }) {
       resolve({ ok: code === 0, code, sessionID: sid, text, stderr: stderr.trim() });
     });
   });
-}
-
-function runOpencodeSessionList({ maxCount = 200 } = {}) {
-  return new Promise((resolve) => {
-    const safeMax = Number.isFinite(maxCount) && maxCount > 0 && maxCount <= 2000 ? Math.floor(maxCount) : 200;
-    const args = ['exec', 'agent_opencode', 'opencode', 'session', 'list', '--format', 'json', '--max-count', String(safeMax)];
-    const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d) => (stdout += d.toString('utf8')));
-    child.stderr.on('data', (d) => (stderr += d.toString('utf8')));
-
-    child.on('close', (code) => {
-      if (code !== 0) {
-        resolve({ ok: false, code, sessions: [], stderr: stderr.trim() });
-        return;
-      }
-      try {
-        const data = JSON.parse(stdout || '[]');
-        resolve({ ok: true, code: 0, sessions: Array.isArray(data) ? data : [], stderr: stderr.trim() });
-      } catch (err) {
-        resolve({ ok: false, code: 0, sessions: [], stderr: `parse_error: ${String(err?.message || err)}` });
-      }
-    });
-  });
-}
-
-async function handleSessionNew(res, body) {
-  const chatId = body?.chatId;
-  const threadId = body?.threadId ?? 0;
-  const topicKey = String(body?.topicKey || 'General');
-  const from = body?.from || {};
-  const requestedModel = String(body?.model || OPENCODE_MODEL_DEFAULT || '').trim();
-
-  if (!chatId) {
-    res.writeHead(400, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: 'missing chatId' }));
-    return;
-  }
-
-  const fileset = loadFilesetSnippet();
-  const contextPrefix = `# Contexto do tópico\n- topicKey: ${topicKey}\n- threadId: ${threadId}\n- user: ${from.username || from.id || 'unknown'}`;
-  const title = `${topicKey} (tg:${threadId}) [new ${new Date().toISOString().slice(0, 19)}]`;
-
-  const initPrompt = [
-    BASE_POLICY,
-    fileset ? `\n${fileset}` : '',
-    `\n${contextPrefix}`,
-    '',
-    '# Iniciar nova sessão',
-    'Crie uma nova sessão independente para este tópico.',
-    'Responda apenas: OK',
-  ].join('\n');
-
-  const t0 = Date.now();
-  const created = await runOpencode({ sessionID: null, title, model: requestedModel, message: initPrompt });
-  const newSessionID = created?.sessionID || null;
-
-  logEvent('session_new', {
-    chatId,
-    threadId,
-    topicKey,
-    ok: !!newSessionID && created.ok,
-    code: created.code,
-    ms: Date.now() - t0,
-    sessionID_out: newSessionID,
-    model: requestedModel || null,
-  });
-
-  if (!newSessionID) {
-    res.writeHead(500, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: 'failed_to_create_session', stderr: created?.stderr || null }));
-    return;
-  }
-
-  const updated = upsertSessionEntry(chatId, threadId, (prev) => {
-    const history = Array.isArray(prev?.history) ? prev.history.slice() : (prev?.sessionID ? [prev.sessionID] : []);
-    if (!history.includes(newSessionID)) history.unshift(newSessionID);
-    return {
-      ...(prev || {}),
-      chatId,
-      threadId,
-      topicKey,
-      sessionID: newSessionID,
-      history,
-      createdAt: prev?.createdAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      lastUsedAt: new Date().toISOString(),
-      lastAction: 'new',
-    };
-  });
-
-  res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ ok: true, key: updated.key, entry: updated.entry, sessionID: newSessionID }));
-}
-
-async function handleSessionSet(res, body) {
-  const chatId = body?.chatId;
-  const threadId = body?.threadId ?? 0;
-  const sessionID = String(body?.sessionID || '').trim();
-
-  if (!chatId || !sessionID) {
-    res.writeHead(400, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: 'missing chatId/sessionID' }));
-    return;
-  }
-
-  const updated = upsertSessionEntry(chatId, threadId, (prev) => {
-    const history = Array.isArray(prev?.history) ? prev.history.slice() : (prev?.sessionID ? [prev.sessionID] : []);
-    if (!history.includes(sessionID)) history.unshift(sessionID);
-    return {
-      ...(prev || {}),
-      chatId,
-      threadId,
-      topicKey: prev?.topicKey || String(body?.topicKey || 'General'),
-      sessionID,
-      history,
-      createdAt: prev?.createdAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      lastUsedAt: new Date().toISOString(),
-      lastAction: 'set',
-    };
-  });
-
-  logEvent('session_set', { key: updated.key, sessionID });
-  res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ ok: true, key: updated.key, entry: updated.entry }));
 }
 
 async function handleRespond(res, body) {
@@ -434,23 +278,9 @@ async function handleRespond(res, body) {
 
   const result = final;
 
-  if (sid) {
-    const now = new Date().toISOString();
-    const prev = map.sessions[key] || null;
-    const history = Array.isArray(prev?.history) ? prev.history.slice() : (prev?.sessionID ? [prev.sessionID] : []);
-    if (!history.includes(sid)) history.unshift(sid);
-    map.sessions[key] = {
-      ...(prev || {}),
-      sessionID: sid,
-      topicKey,
-      threadId,
-      chatId,
-      history,
-      createdAt: prev?.createdAt || now,
-      updatedAt: now,
-      lastUsedAt: now,
-      lastAction: 'respond',
-    };
+  if (!sessionID && (sid || result.sessionID)) {
+    sessionID = sid || result.sessionID;
+    map.sessions[key] = { sessionID, topicKey, threadId, chatId, createdAt: new Date().toISOString() };
     writeJsonAtomic(SESSION_MAP_PATH, map);
   }
 
@@ -480,7 +310,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && req.url && (req.url === '/session' || req.url.startsWith('/session?'))) {
+  if (req.method === 'GET' && req.url && req.url.startsWith('/session')) {
     const u = new URL(req.url, 'http://localhost');
     const chatId = u.searchParams.get('chatId');
     const threadId = u.searchParams.get('threadId');
@@ -497,63 +327,9 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && req.url && req.url.startsWith('/sessions')) {
-    const u = new URL(req.url, 'http://localhost');
-    const chatId = u.searchParams.get('chatId');
-    const entries = listSessionEntries({ chatId: chatId || null });
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, sessions: entries }));
-    return;
-  }
-
-  if (req.method === 'GET' && req.url && req.url.startsWith('/opencode/sessions')) {
-    const u = new URL(req.url, 'http://localhost');
-    const maxCount = Number.parseInt(u.searchParams.get('maxCount') || '200', 10);
-    void (async () => {
-      const result = await runOpencodeSessionList({ maxCount });
-      res.writeHead(result.ok ? 200 : 500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(result));
-    })();
-    return;
-  }
-
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/session/new') {
-    let bodyText = '';
-    req.on('data', (c) => (bodyText += c.toString('utf8')));
-    req.on('end', () => {
-      let body;
-      try {
-        body = JSON.parse(bodyText || '{}');
-      } catch {
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'invalid json' }));
-        return;
-      }
-      void handleSessionNew(res, body);
-    });
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/session/set') {
-    let bodyText = '';
-    req.on('data', (c) => (bodyText += c.toString('utf8')));
-    req.on('end', () => {
-      let body;
-      try {
-        body = JSON.parse(bodyText || '{}');
-      } catch {
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'invalid json' }));
-        return;
-      }
-      void handleSessionSet(res, body);
-    });
     return;
   }
 
