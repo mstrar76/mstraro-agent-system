@@ -1,0 +1,8 @@
+mcp-neo4j-graphrag>=0.1.0
+python-dotenv>=1.0.0
+neo4j>=5.23.0
+openai>=1.0.0
+sentence-transformers>=2.2.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+sse-starlette>=2.0.0
