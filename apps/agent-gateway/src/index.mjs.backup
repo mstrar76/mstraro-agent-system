@@ -2,7 +2,6 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { autoBootOnStartup } from './boot.mjs';
 
 const PORT = Number(process.env.PORT || 8787);
 const OPENCODE_IMAGE = process.env.OPENCODE_IMAGE;
@@ -578,13 +577,6 @@ const server = http.createServer((req, res) => {
   res.writeHead(404, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'not found' }));
 });
-
-// Auto-boot antes de iniciar servidor
-let bootContext = null;
-void (async () => {
-  bootContext = await autoBootOnStartup();
-  console.log('[GATEWAY] Iniciando servidor com contexto de boot:', bootContext?.timestamp);
-})();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`agent-gateway listening on :${PORT}`);
