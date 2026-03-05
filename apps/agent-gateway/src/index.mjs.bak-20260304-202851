@@ -12,10 +12,6 @@ const OPENCODE_TIMEOUT_MS = Number(process.env.OPENCODE_TIMEOUT_MS || 90000);
 const SESSION_MAP_PATH = process.env.SESSION_MAP_PATH || '/data/session-map.json';
 const FILESET_DIR = process.env.FILESET_DIR || '/workspace/fileset';
 
-const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || '/workspace';
-const AGENTS_ROOT = process.env.AGENTS_ROOT || path.join(WORKSPACE_ROOT, 'agents');
-const SHARED_FILESET_DIR = process.env.SHARED_FILESET_DIR || FILESET_DIR;
-
 const ATHENA_SEARCH_ENABLED = /^(1|true|yes)$/i.test(String(process.env.ATHENA_SEARCH_ENABLED || ''));
 const ATHENA_SEARCH_TOP_K = Math.max(0, Math.min(10, Number(process.env.ATHENA_SEARCH_TOP_K || 3)));
 const ATHENA_SEARCH_MAX_CHARS = Math.max(200, Math.min(6000, Number(process.env.ATHENA_SEARCH_MAX_CHARS || 1800)));
@@ -232,89 +228,12 @@ function upsertSessionEntry(chatId, threadId, updater) {
   return { key, entry: next };
 }
 
-function sanitizeAgentKey(input) {
-  const raw = String(input || '').trim().toLowerCase();
-  if (!raw) return 'general';
-  const cleaned = raw.replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^[-_]+|[-_]+$/g, '');
-  return cleaned.slice(0, 40) || 'general';
-}
-
-function ensureSymlink(linkPath, targetPath) {
-  try {
-    const st = fs.lstatSync(linkPath);
-    if (st.isSymbolicLink()) {
-      const cur = fs.readlinkSync(linkPath);
-      if (cur === targetPath) return;
-    }
-    // if exists but not the right symlink, don't destroy user files
-    return;
-  } catch {
-    // doesn't exist -> create
-  }
-  try {
-    fs.symlinkSync(targetPath, linkPath);
-  } catch {
-    // ignore
-  }
-}
-
-function ensureAgentWorkspace({ agentKey, topicKey }) {
-  const safeKey = sanitizeAgentKey(agentKey || topicKey || 'general');
-  const workdir = path.join(AGENTS_ROOT, safeKey);
-  const filesetDir = path.join(workdir, 'fileset');
-
-  fs.mkdirSync(workdir, { recursive: true });
-  fs.mkdirSync(filesetDir, { recursive: true });
-
-  // Seed fileset with shared defaults (first-time only per file)
-  try {
-    const names = fs.readdirSync(SHARED_FILESET_DIR);
-    for (const name of names) {
-      const src = path.join(SHARED_FILESET_DIR, name);
-      const dst = path.join(filesetDir, name);
-      if (fs.existsSync(dst)) continue;
-      const st = fs.statSync(src);
-      if (!st.isFile()) continue;
-      fs.copyFileSync(src, dst);
-    }
-  } catch {
-    // ignore
-  }
-
-  const agentMd = path.join(filesetDir, 'AGENT.md');
-  if (!fs.existsSync(agentMd)) {
-    fs.writeFileSync(
-      agentMd,
-      [
-        '# AGENT',
-        '',
-        `agentKey: ${safeKey}`,
-        `topicKey: ${String(topicKey || '').trim() || safeKey}`,
-        '',
-        'Foco:',
-        `- Você opera prioritariamente para este tópico/agent (${safeKey}).`,
-        '- Não misture contexto com outros tópicos/agents.',
-        '- Se precisar de contexto global, peça explicitamente ou use busca (Athena).',
-        '',
-      ].join('\n'),
-    );
-  }
-
-  // Helpful symlinks to shared bootstrap docs (keeps them in-sync without duplicating)
-  ensureSymlink(path.join(workdir, 'BOOT-SHARED.md'), path.join(WORKSPACE_ROOT, 'BOOT-SHARED.md'));
-  ensureSymlink(path.join(workdir, 'CONTEXT-SNAPSHOT.md'), path.join(WORKSPACE_ROOT, 'CONTEXT-SNAPSHOT.md'));
-  ensureSymlink(path.join(workdir, 'INDEX.md'), path.join(WORKSPACE_ROOT, 'INDEX.md'));
-
-  return { agentKey: safeKey, workdir, filesetDir };
-}
-
-function loadFilesetSnippet(filesetDir) {
-  const root = filesetDir || SHARED_FILESET_DIR;
-  const wanted = ['AGENT.md', 'BOT-RULES.md', 'DELEGATION.md', 'connectors.md', 'SOUL.md', 'IDENTITY.md', 'MEMORY.md', 'policies.md', 'DIRECTORIES.md'];
+function loadFilesetSnippet() {
+  const wanted = ['BOT-RULES.md', 'DELEGATION.md', 'connectors.md', 'SOUL.md', 'IDENTITY.md', 'MEMORY.md', 'policies.md', 'DIRECTORIES.md'];
   const parts = [];
 
   for (const name of wanted) {
-    const p = path.join(root, name);
+    const p = path.join(FILESET_DIR, name);
     if (!fs.existsSync(p)) continue;
     const content = fs.readFileSync(p, 'utf8').trim();
     if (!content) continue;
@@ -360,7 +279,7 @@ function extractResult(events) {
   return { sessionID, text: text.trim() };
 }
 
-function runOpencode({ sessionID, title, model, message, workdir }) {
+function runOpencode({ sessionID, title, model, message }) {
   return new Promise((resolve) => {
     if (!OPENCODE_IMAGE) {
       resolve({ ok: false, code: -1, sessionID: null, text: '', stderr: 'Missing OPENCODE_IMAGE' });
@@ -387,7 +306,7 @@ function runOpencode({ sessionID, title, model, message, workdir }) {
       '-v',
       '/home/concierge/agent-system/data/opencode/workspace:/workspace',
       '-w',
-      workdir || OPENCODE_WORKDIR,
+      OPENCODE_WORKDIR,
       OPENCODE_IMAGE,
       ...args,
     ];
@@ -449,8 +368,7 @@ async function handleSessionNew(res, body) {
     return;
   }
 
-  const agentWs = ensureAgentWorkspace({ agentKey: body?.agentKey, topicKey });
-  const fileset = loadFilesetSnippet(agentWs.filesetDir);
+  const fileset = loadFilesetSnippet();
   const contextPrefix = `# Contexto do tópico\n- topicKey: ${topicKey}\n- threadId: ${threadId}\n- user: ${from.username || from.id || 'unknown'}`;
   const title = `${topicKey} (tg:${threadId}) [new ${new Date().toISOString().slice(0, 19)}]`;
 
@@ -465,7 +383,7 @@ async function handleSessionNew(res, body) {
   ].join('\n');
 
   const t0 = Date.now();
-  const created = await runOpencode({ sessionID: null, title, model: requestedModel, message: initPrompt, workdir: agentWs.workdir });
+  const created = await runOpencode({ sessionID: null, title, model: requestedModel, message: initPrompt });
   const newSessionID = created?.sessionID || null;
 
   logEvent('session_new', {
@@ -493,8 +411,6 @@ async function handleSessionNew(res, body) {
       chatId,
       threadId,
       topicKey,
-      agentKey: agentWs.agentKey,
-      workdir: agentWs.workdir,
       sessionID: newSessionID,
       history,
       createdAt: prev?.createdAt || new Date().toISOString(),
@@ -519,8 +435,6 @@ async function handleSessionSet(res, body) {
     return;
   }
 
-  const prevAgentKey = String(body?.agentKey || body?.topicKey || '').trim() || null;
-  const agentWs = ensureAgentWorkspace({ agentKey: prevAgentKey || null, topicKey: body?.topicKey || 'General' });
   const updated = upsertSessionEntry(chatId, threadId, (prev) => {
     const history = Array.isArray(prev?.history) ? prev.history.slice() : (prev?.sessionID ? [prev.sessionID] : []);
     if (!history.includes(sessionID)) history.unshift(sessionID);
@@ -529,8 +443,6 @@ async function handleSessionSet(res, body) {
       chatId,
       threadId,
       topicKey: prev?.topicKey || String(body?.topicKey || 'General'),
-      agentKey: prev?.agentKey || agentWs.agentKey,
-      workdir: prev?.workdir || agentWs.workdir,
       sessionID,
       history,
       createdAt: prev?.createdAt || new Date().toISOString(),
@@ -574,12 +486,9 @@ async function handleRespond(res, body) {
   const map = readJson(SESSION_MAP_PATH, { sessions: {} });
   if (!map.sessions) map.sessions = {};
   const key = `${chatId}:${threadId}`;
-  const prevEntry = map.sessions[key] || null;
-  let sessionID = prevEntry?.sessionID || null;
+  let sessionID = map.sessions[key]?.sessionID || null;
 
-  const agentWs = ensureAgentWorkspace({ agentKey: prevEntry?.agentKey || body?.agentKey, topicKey });
-
-  const fileset = loadFilesetSnippet(agentWs.filesetDir);
+  const fileset = loadFilesetSnippet();
   const title = `${topicKey} (tg:${threadId})`;
 
   const contextPrefix = `# Contexto do tópico\n- topicKey: ${topicKey}\n- threadId: ${threadId}\n- user: ${from.username || from.id || 'unknown'}`;
@@ -599,7 +508,7 @@ async function handleRespond(res, body) {
   const message = finalPrompt;
 
   const t0 = Date.now();
-  const first = await runOpencode({ sessionID, title: sessionID ? null : title, model, message, workdir: agentWs.workdir });
+  const first = await runOpencode({ sessionID, title: sessionID ? null : title, model, message });
   const sid = sessionID || first.sessionID || null;
   let final = first;
   let secondPass = false;
@@ -619,7 +528,7 @@ async function handleRespond(res, body) {
       userText,
     ].join('\n');
 
-    const second = await runOpencode({ sessionID: sid, title: null, model, message: followup, workdir: agentWs.workdir });
+    const second = await runOpencode({ sessionID: sid, title: null, model, message: followup });
     if ((second.text || '').trim()) final = second;
   }
 
@@ -651,8 +560,6 @@ async function handleRespond(res, body) {
       topicKey,
       threadId,
       chatId,
-      agentKey: prev?.agentKey || agentWs.agentKey,
-      workdir: prev?.workdir || agentWs.workdir,
       history,
       createdAt: prev?.createdAt || now,
       updatedAt: now,
@@ -682,11 +589,7 @@ const server = http.createServer((req, res) => {
           modelConfig: getOpencodeConfigModel(),
           timeoutMs: OPENCODE_TIMEOUT_MS,
         },
-        workspace: {
-          root: WORKSPACE_ROOT,
-          agentsRoot: AGENTS_ROOT,
-          sharedFilesetDir: SHARED_FILESET_DIR,
-        },
+        fileset: { dir: FILESET_DIR },
       }),
     );
     return;

@@ -1,6 +1,8 @@
+version: '3.8'
+
 services:
   athena-mcp:
-    image: agent-system-athena-mcp
+    build: ./apps/athena-mcp
     container_name: agent_athena_mcp
     restart: unless-stopped
     ports:

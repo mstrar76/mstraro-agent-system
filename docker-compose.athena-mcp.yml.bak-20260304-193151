@@ -1,16 +1,17 @@
+version: '3.8'
+
 services:
   athena-mcp:
-    image: agent-system-athena-mcp
+    build: ./apps/athena-mcp
     container_name: agent_athena_mcp
     restart: unless-stopped
     ports:
       - "127.0.0.1:8888:8888"
-    env_file:
-      - ./config/secrets.neo4j.env
     environment:
       # Neo4j is accessible via Docker network (agent_neo4j is on the same network)
       - NEO4J_URI=bolt://agent_neo4j:7687
       - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
       - NEO4J_DATABASE=neo4j
       # Using local sentence-transformer (no API key needed)
       - EMBEDDING_MODEL=all-MiniLM-L6-v2
@@ -20,8 +21,7 @@ services:
       - FULLTEXT_TOP_K=10
       - RRF_K=60
     networks:
-      - agent_net
-      - neo4j_default
+      - agent-network
     volumes:
       - ./apps/athena-mcp:/app:ro
       - ./logs/athena-mcp:/var/log/athena-mcp
@@ -32,7 +32,6 @@ services:
         max-file: "3"
 
 networks:
-  agent_net:
+  agent-network:
     external: true
-  neo4j_default:
-    external: true
+    name: agent-system_default

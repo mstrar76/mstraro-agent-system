@@ -682,11 +682,7 @@ const server = http.createServer((req, res) => {
           modelConfig: getOpencodeConfigModel(),
           timeoutMs: OPENCODE_TIMEOUT_MS,
         },
-        workspace: {
-          root: WORKSPACE_ROOT,
-          agentsRoot: AGENTS_ROOT,
-          sharedFilesetDir: SHARED_FILESET_DIR,
-        },
+        fileset: { dir: FILESET_DIR },
       }),
     );
     return;
