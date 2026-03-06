@@ -21,6 +21,9 @@ const ATHENA_SEARCH_TOP_K = Math.max(0, Math.min(10, Number(process.env.ATHENA_S
 const ATHENA_SEARCH_MAX_CHARS = Math.max(200, Math.min(6000, Number(process.env.ATHENA_SEARCH_MAX_CHARS || 1800)));
 const ATHENA_SEARCH_MIN_CHARS = Math.max(0, Math.min(200, Number(process.env.ATHENA_SEARCH_MIN_CHARS || 24)));
 
+const ATHENA_INGEST_ENABLED = /^(1|true|yes)$/i.test(String(process.env.ATHENA_INGEST_ENABLED || '1'));
+const ATHENA_INGEST_TIMEOUT_MS = Number(process.env.ATHENA_INGEST_TIMEOUT_MS || 5000);
+
 const BASE_POLICY = [
   'Você é o Gestor (orquestrador) do sistema OpenClaw-style.',
   'Ambiente:',
@@ -120,6 +123,8 @@ function runCmdCapture(cmd, args, { timeoutMs = 2500 } = {}) {
     child.stderr.on('data', (c) => (stderr += c.toString('utf8')));
     child.on('close', (code) => {
       clearTimeout(timer);
+      try { fs.unlinkSync(cidFile); } catch { /* ignore */ }
+      try { fs.unlinkSync(cidFile); } catch { /* ignore */ }
       resolve({ ok: code === 0, code, stdout, stderr: (stderr || '').slice(0, 2000), timeout: false });
     });
     child.on('error', (e) => {
@@ -260,13 +265,29 @@ function ensureSymlink(linkPath, targetPath) {
 
 function ensureAgentWorkspace({ agentKey, topicKey }) {
   const safeKey = sanitizeAgentKey(agentKey || topicKey || 'general');
-  const workdir = path.join(AGENTS_ROOT, safeKey);
-  const filesetDir = path.join(workdir, 'fileset');
+  const agentDir = path.join(AGENTS_ROOT, safeKey);
+  const filesetDir = path.join(agentDir, 'fileset');
 
-  fs.mkdirSync(workdir, { recursive: true });
+  fs.mkdirSync(agentDir, { recursive: true });
   fs.mkdirSync(filesetDir, { recursive: true });
 
   // Seed fileset with shared defaults (first-time only per file)
+  // For core bootstrap docs, prefer symlinks so updates propagate to all agents.
+  const SYMLINK_FILESET = new Set([
+    'BOT-RULES.md',
+    'DAILY-REVIEW.md',
+    'DELEGATION.md',
+    'DIRECTORIES.md',
+    'FILESET.md',
+    'IDENTITY.md',
+    'MEMORY.md',
+    'SOUL.md',
+    'TOOLS.md',
+    'USER.md',
+    'connectors.md',
+    'policies.md',
+  ]);
+
   try {
     const names = fs.readdirSync(SHARED_FILESET_DIR);
     for (const name of names) {
@@ -275,6 +296,16 @@ function ensureAgentWorkspace({ agentKey, topicKey }) {
       if (fs.existsSync(dst)) continue;
       const st = fs.statSync(src);
       if (!st.isFile()) continue;
+
+      if (SYMLINK_FILESET.has(name)) {
+        try {
+          fs.symlinkSync(src, dst);
+          continue;
+        } catch {
+          // fall back to copy
+        }
+      }
+
       fs.copyFileSync(src, dst);
     }
   } catch {
@@ -301,11 +332,13 @@ function ensureAgentWorkspace({ agentKey, topicKey }) {
   }
 
   // Helpful symlinks to shared bootstrap docs (keeps them in-sync without duplicating)
-  ensureSymlink(path.join(workdir, 'BOOT-SHARED.md'), path.join(WORKSPACE_ROOT, 'BOOT-SHARED.md'));
-  ensureSymlink(path.join(workdir, 'CONTEXT-SNAPSHOT.md'), path.join(WORKSPACE_ROOT, 'CONTEXT-SNAPSHOT.md'));
-  ensureSymlink(path.join(workdir, 'INDEX.md'), path.join(WORKSPACE_ROOT, 'INDEX.md'));
+  ensureSymlink(path.join(agentDir, 'BOOT-SHARED.md'), path.join(WORKSPACE_ROOT, 'BOOT-SHARED.md'));
+  ensureSymlink(path.join(agentDir, 'CONTEXT-SNAPSHOT.md'), path.join(WORKSPACE_ROOT, 'CONTEXT-SNAPSHOT.md'));
+  ensureSymlink(path.join(agentDir, 'INDEX.md'), path.join(WORKSPACE_ROOT, 'INDEX.md'));
 
-  return { agentKey: safeKey, workdir, filesetDir };
+  const opencodeWorkdir = OPENCODE_WORKDIR || WORKSPACE_ROOT;
+
+  return { agentKey: safeKey, agentDir, workdir: opencodeWorkdir, filesetDir };
 }
 
 function loadFilesetSnippet(filesetDir) {
@@ -318,11 +351,37 @@ function loadFilesetSnippet(filesetDir) {
     if (!fs.existsSync(p)) continue;
     const content = fs.readFileSync(p, 'utf8').trim();
     if (!content) continue;
-    parts.push(`\n\n### ${name}\n${content}`);
+    parts.push(`
+
+### ${name}
+${content}`);
+  }
+
+  // Always include shared MEMORY.md (global) in addition to per-agent MEMORY.md.
+  // This prevents custom agents from missing global invariants.
+  try {
+    const sharedMem = path.join(SHARED_FILESET_DIR, 'MEMORY.md');
+    const agentMem = path.join(root, 'MEMORY.md');
+
+    if (fs.existsSync(sharedMem)) {
+      const sharedReal = fs.realpathSync(sharedMem);
+      const agentReal = fs.existsSync(agentMem) ? fs.realpathSync(agentMem) : null;
+
+      if (!agentReal || agentReal !== sharedReal) {
+        const content = fs.readFileSync(sharedMem, 'utf8').trim();
+        if (content) parts.push(`
+
+### SHARED-MEMORY.md
+${content}`);
+      }
+    }
+  } catch {
+    // ignore
   }
 
   if (!parts.length) return '';
-  return `# FILESET (core)\n${parts.join('')}`;
+  return `# FILESET (core)
+${parts.join('')}`;
 }
 
 function getOpencodeConfigModel() {
@@ -360,6 +419,140 @@ function extractResult(events) {
   return { sessionID, text: text.trim() };
 }
 
+function extractToolCalls(events, { max = 20 } = {}) {
+  const out = [];
+  const arr = Array.isArray(events) ? events : [];
+
+  for (const e of arr) {
+    if (out.length >= max) break;
+    if (!e) continue;
+
+    // OpenCode JSON event shape: { type: 'tool_use', part: { tool, state: { input, output, metadata } } }
+    if (e.type === 'tool_use' && e.part && typeof e.part === 'object') {
+      const tool = String(e.part.tool || '').trim();
+      const state = e.part.state || {};
+      const input = state.input || {};
+      const metadata = state.metadata || {};
+      out.push({
+        tool,
+        command: typeof input.command === 'string' ? input.command : null,
+        description: typeof input.description === 'string' ? input.description : null,
+        exit: typeof metadata.exit === 'number' ? metadata.exit : null,
+      });
+      continue;
+    }
+
+    // Fallback: some formats embed tool parts differently
+    if (e.type === 'tool' && e.tool && e.state) {
+      const tool = String(e.tool || '').trim();
+      const input = e.state.input || {};
+      const metadata = e.state.metadata || {};
+      out.push({
+        tool,
+        command: typeof input.command === 'string' ? input.command : null,
+        description: typeof input.description === 'string' ? input.description : null,
+        exit: typeof metadata.exit === 'number' ? metadata.exit : null,
+      });
+    }
+  }
+
+  return out;
+}
+
+function redactSecrets(str) {
+  const s = String(str || '');
+  if (!s) return s;
+
+  // common patterns
+  let x = s
+    .replace(/(pwd=)[^&\s]+/gi, '$1***')
+    .replace(/(password=)[^&\s]+/gi, '$1***')
+    .replace(/(--dbpass=)[^\s]+/gi, '$1***')
+    .replace(/(IDENTIFIED\s+BY\s+)[^;\s]+/gi, '$1***')
+    .replace(/(NEO4J_AUTH=)[^\s]+/gi, '$1***');
+
+  // redact long base64-ish tokens
+  x = x.replace(/[A-Za-z0-9+/=]{32,}/g, (m) => (m.length >= 32 ? '***' : m));
+  return x;
+}
+
+function isImpactfulCommand(cmd) {
+  const c = String(cmd || '');
+  if (!c) return false;
+  return /(apt-get\s+install|apt\s+install|dnf\s+install|yum\s+install|systemctl\s+(start|stop|restart|reload)|nginx\s+-s\s+reload|nginx\s+-t|certbot|wp\s+|mariadb|mysql|docker\s+compose\s+|docker\s+run\s+|rsync|tar)/i.test(c);
+}
+
+async function athenaIngestDecisions(decisions, { agentType = 'gestor', source = null } = {}) {
+  if (!ATHENA_INGEST_ENABLED) return { ok: false, skipped: true };
+  const items = Array.isArray(decisions) ? decisions : [];
+  if (!items.length) return { ok: true, upserted: 0 };
+
+  const payload = JSON.stringify({ agent_type: agentType, source, decisions: items });
+
+  return await new Promise((resolve) => {
+    const req = http.request(
+      'http://agent_athena_mcp:8888/ingest/decisions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        },
+        timeout: ATHENA_INGEST_TIMEOUT_MS,
+      },
+      (res) => {
+        let body = '';
+        res.on('data', (c) => (body += c.toString('utf8')));
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            resolve({ ok: res.statusCode === 200, status: res.statusCode, data });
+          } catch {
+            resolve({ ok: false, status: res.statusCode, data: null });
+          }
+        });
+      },
+    );
+
+    req.on('error', (e) => resolve({ ok: false, error: String(e?.message || e) }));
+    req.on('timeout', () => {
+      try { req.destroy(); } catch {}
+      resolve({ ok: false, timeout: true });
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+function buildDecisionsFromToolCalls({ topicKey, sessionID, toolCalls, chatId, threadId }) {
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  const impactful = calls
+    .filter((c) => c && String(c.tool || '').toLowerCase() === 'bash')
+    .map((c) => ({ ...c, command: redactSecrets(c.command) }))
+    .filter((c) => isImpactfulCommand(c.command));
+
+  if (!impactful.length) return [];
+
+  const lines = impactful.slice(0, 12).map((c) => `- ${String(c.command || '').slice(0, 200)}`);
+  const decisionText = `Comandos de mudança executados:
+${lines.join('\n')}`;
+
+  return [
+    {
+      topic: String(topicKey || 'General'),
+      name: `${String(topicKey || 'General')}: mudanças aplicadas`,
+      decision: decisionText,
+      rationale: 'Registrar mudanças reais no VPS para memória persistente e rastreabilidade.',
+      summary: `Mudanças aplicadas via bash (${impactful.length} comando(s) relevantes).`,
+      status: 'done',
+      level: 'infra',
+      session_id: sessionID || null,
+      source: `tg:${chatId}:${threadId}`,
+    },
+  ];
+}
+
 function runOpencode({ sessionID, title, model, message, workdir }) {
   return new Promise((resolve) => {
     if (!OPENCODE_IMAGE) {
@@ -373,9 +566,14 @@ function runOpencode({ sessionID, title, model, message, workdir }) {
     if (sessionID) args.push('--session', sessionID);
     args.push(message);
 
+    const cidFile = `/tmp/opencode-cid-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+
     const dockerArgs = [
       'run',
       '--rm',
+      '--cidfile',
+      cidFile,
       '-v',
       '/home/concierge/agent-system/data/opencode/config:/root/.config/opencode',
       '-v',
@@ -386,6 +584,8 @@ function runOpencode({ sessionID, title, model, message, workdir }) {
       '/home/concierge/agent-system/data/opencode/home:/root/.opencode',
       '-v',
       '/home/concierge/agent-system/data/opencode/workspace:/workspace',
+      '-v',
+      '/:/host',
       '-w',
       workdir || OPENCODE_WORKDIR,
       OPENCODE_IMAGE,
@@ -397,15 +597,25 @@ function runOpencode({ sessionID, title, model, message, workdir }) {
     let stdout = '';
     let stderr = '';
 
-    const timer = setTimeout(() => child.kill('SIGKILL'), OPENCODE_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      try {
+        const cid = fs.readFileSync(cidFile, 'utf8').trim();
+        if (cid) spawn('docker', ['kill', cid], { stdio: ['ignore', 'ignore', 'ignore'] });
+      } catch {
+        // ignore
+      }
+      child.kill('SIGKILL');
+    }, OPENCODE_TIMEOUT_MS);
     child.stdout.on('data', (d) => (stdout += d.toString('utf8')));
     child.stderr.on('data', (d) => (stderr += d.toString('utf8')));
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      try { fs.unlinkSync(cidFile); } catch { /* ignore */ }
       const events = parseJsonEvents(stdout);
       const { sessionID: sid, text } = extractResult(events);
-      resolve({ ok: code === 0, code, sessionID: sid, text, stderr: stderr.trim() });
+      const toolCalls = extractToolCalls(events);
+      resolve({ ok: code === 0, code, sessionID: sid, text, toolCalls, stderr: stderr.trim() });
     });
   });
 }

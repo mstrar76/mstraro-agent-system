@@ -1,3 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Pin CPU-only PyTorch to avoid pulling CUDA+nvidia wheels (saves several GB)
+torch==2.10.0+cpu
+
 mcp-neo4j-graphrag>=0.1.0
 python-dotenv>=1.0.0
 neo4j>=5.23.0

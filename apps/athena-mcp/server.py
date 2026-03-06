@@ -18,8 +18,9 @@ Endpoints:
 import asyncio
 import json
 import logging
+import hashlib
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from fastapi import FastAPI, Request
@@ -284,79 +285,205 @@ def recall_context(
 ) -> Dict[str, Any]:
     """
     Recall context from recent sessions.
-    
+
     Retrieves:
     - Recent decisions
     - Recent entities
     - Recent sessions
     - Checkpoints
+
+    Notes:
+    - Uses `created_at_ts` (epoch ms) when available to filter by `days`.
     """
     start_time = datetime.now()
-    
+    cutoff_ts = int((datetime.now() - timedelta(days=int(days or 0))).timestamp() * 1000)
+
     with get_driver().session(database=NEO4J_DATABASE) as session:
-        results = {}
-        
+        results: Dict[str, Any] = {}
+
         # Recent decisions
-        if agent_type:
-            query = """
-            MATCH (d:Decision)
-            WHERE d.agent_type = $agent_type
-            RETURN d.name as name, d.description as description, d.created_at as created_at
-            ORDER BY d.created_at DESC
-            LIMIT $top_k
-            """
-            result = session.run(query, agent_type=agent_type, top_k=top_k)
-            results["decisions"] = [serialize_for_json(record.data()) for record in result]
-        else:
-            query = """
-            MATCH (d:Decision)
-            RETURN d.name as name, d.description as description, d.created_at as created_at
-            ORDER BY d.created_at DESC
-            LIMIT $top_k
-            """
-            result = session.run(query, top_k=top_k)
-            results["decisions"] = [serialize_for_json(record.data()) for record in result]
-        
+        decisions_query = """
+        MATCH (d:Decision)
+        WHERE ($agent_type IS NULL OR d.agent_type = $agent_type)
+          AND (d.created_at_ts IS NULL OR d.created_at_ts >= $cutoff_ts)
+        RETURN
+          d.name AS name,
+          coalesce(d.summary, d.description, d.decision, d.rationale) AS description,
+          d.topic AS topic,
+          d.session_id AS session_id,
+          d.status AS status,
+          d.level AS level,
+          d.created_at AS created_at,
+          d.created_at_ts AS created_at_ts
+        ORDER BY coalesce(d.created_at_ts, 0) DESC
+        LIMIT $top_k
+        """
+        result = session.run(decisions_query, agent_type=agent_type, cutoff_ts=cutoff_ts, top_k=top_k)
+        results['decisions'] = [serialize_for_json(r.data()) for r in result]
+
         # Recent entities
-        query = """
+        entities_query = """
         MATCH (e:Entity)
         RETURN e.name as name, e.description as description, e.created_at as created_at
         ORDER BY e.created_at DESC
         LIMIT $top_k
         """
-        result = session.run(query, top_k=top_k)
-        results["entities"] = [serialize_for_json(record.data()) for record in result]
-        
+        result = session.run(entities_query, top_k=top_k)
+        results['entities'] = [serialize_for_json(r.data()) for r in result]
+
         # Recent sessions
-        query = """
+        sessions_query = """
         MATCH (s:Session)
         RETURN s.id as id, s.title as title, s.start_time as start_time
         ORDER BY s.start_time DESC
         LIMIT $top_k
         """
-        result = session.run(query, top_k=top_k)
-        results["sessions"] = [serialize_for_json(record.data()) for record in result]
-        
+        result = session.run(sessions_query, top_k=top_k)
+        results['sessions'] = [serialize_for_json(r.data()) for r in result]
+
         # Checkpoints
-        query = """
+        checkpoints_query = """
         MATCH (c:Checkpoint)
         RETURN c.name as name, c.description as description, c.created_at as created_at
         ORDER BY c.created_at DESC
         LIMIT $top_k
         """
-        result = session.run(query, top_k=top_k)
-        results["checkpoints"] = [serialize_for_json(record.data()) for record in result]
-    
+        result = session.run(checkpoints_query, top_k=top_k)
+        results['checkpoints'] = [serialize_for_json(r.data()) for r in result]
+
     elapsed = (datetime.now() - start_time).total_seconds()
-    
+
     return {
-        "agent_type": agent_type,
-        "days": days,
-        "results": serialize_for_json(results),
-        "stats": {
-            "elapsed_ms": elapsed * 1000
-        }
+        'agent_type': agent_type,
+        'days': days,
+        'cutoff_ts': cutoff_ts,
+        'results': serialize_for_json(results),
+        'stats': {
+            'elapsed_ms': elapsed * 1000,
+        },
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# Ingest (write) — Decisions
+# ─────────────────────────────────────────────────────────────
+
+def ensure_decision_schema():
+    """Create minimal constraints/indexes for Decision ingestion."""
+    try:
+        with get_driver().session(database=NEO4J_DATABASE) as session:
+            session.run("CREATE CONSTRAINT decision_id_unique IF NOT EXISTS FOR (d:Decision) REQUIRE d.decision_id IS UNIQUE")
+            session.run("CREATE INDEX decision_created_ts IF NOT EXISTS FOR (d:Decision) ON (d.created_at_ts)")
+    except Exception as e:
+        logger.warning(f"Decision schema ensure failed: {e}")
+
+
+def _decision_id(payload: dict) -> str:
+    raw = {
+        'topic': payload.get('topic'),
+        'name': payload.get('name'),
+        'decision': payload.get('decision'),
+        'rationale': payload.get('rationale'),
+        'summary': payload.get('summary'),
+        'session_id': payload.get('session_id'),
+        'source': payload.get('source'),
+        'agent_type': payload.get('agent_type'),
+        'created_at': payload.get('created_at'),
+    }
+    s = json.dumps(raw, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+    return hashlib.sha1(s.encode('utf-8')).hexdigest()
+
+
+def upsert_decisions(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Upsert Decision nodes with embeddings."""
+    now = datetime.now()
+    now_iso = now.isoformat()
+    now_ts = int(now.timestamp() * 1000)
+
+    normalized = []
+    for d in decisions or []:
+        if not isinstance(d, dict):
+            continue
+        topic = (d.get('topic') or '').strip() or 'General'
+        name = (d.get('name') or '').strip()
+        decision = (d.get('decision') or '').strip()
+        rationale = (d.get('rationale') or '').strip()
+        summary = (d.get('summary') or '').strip()
+        status = (d.get('status') or 'done').strip()
+        level = (d.get('level') or 'operational').strip()
+        session_id = (d.get('session_id') or '').strip()
+        agent_type = (d.get('agent_type') or '').strip() or None
+        source = (d.get('source') or '').strip() or None
+
+        if not name:
+            base = decision or summary or rationale or topic
+            name = (base[:80] + '…') if len(base) > 80 else (base or 'Decision')
+
+        created_at = (d.get('created_at') or now_iso)
+        created_at_ts = int(d.get('created_at_ts') or now_ts)
+
+        payload = {
+            'topic': topic,
+            'name': name,
+            'decision': decision,
+            'rationale': rationale,
+            'summary': summary,
+            'description': d.get('description') or summary or rationale or decision,
+            'status': status,
+            'level': level,
+            'session_id': session_id or None,
+            'agent_type': agent_type,
+            'source': source,
+            'created_at': created_at,
+            'created_at_ts': created_at_ts,
+        }
+        payload['decision_id'] = d.get('decision_id') or d.get('id') or _decision_id(payload)
+
+        embed_text = ' '.join([topic, name, decision, rationale, summary]).strip()
+        if embed_text:
+            try:
+                payload['embedding'] = embed_query(embed_text)
+            except Exception as e:
+                logger.warning(f"Embedding failed: {e}")
+                payload['embedding'] = None
+        else:
+            payload['embedding'] = None
+
+        normalized.append(payload)
+
+    if not normalized:
+        return {'ok': True, 'upserted': 0}
+
+    cypher = """
+    UNWIND $items AS d
+    MERGE (n:Decision {decision_id: d.decision_id})
+    SET
+      n.topic = d.topic,
+      n.name = d.name,
+      n.decision = d.decision,
+      n.rationale = d.rationale,
+      n.summary = d.summary,
+      n.description = d.description,
+      n.status = d.status,
+      n.level = d.level,
+      n.session_id = d.session_id,
+      n.agent_type = d.agent_type,
+      n.source = d.source,
+      n.created_at = d.created_at,
+      n.created_at_ts = d.created_at_ts,
+      n.updated_at = datetime()
+    WITH n, d
+    FOREACH (_ IN CASE WHEN d.embedding IS NULL THEN [] ELSE [1] END |
+      SET n.embedding = d.embedding
+    )
+    RETURN count(n) AS upserted
+    """
+
+    with get_driver().session(database=NEO4J_DATABASE) as session:
+        rec = session.run(cypher, items=normalized).single()
+        upserted = rec['upserted'] if rec else 0
+
+    return {'ok': True, 'upserted': int(upserted)}
 
 # ─────────────────────────────────────────────────────────────
 # API Endpoints
@@ -376,6 +503,48 @@ async def health_check():
 async def get_schema():
     """Get Neo4j schema and indexes"""
     return get_neo4j_schema()
+
+
+@app.post("/ingest/decisions")
+async def ingest_decisions(request: Request):
+    """
+    Ingest Decision nodes into Neo4j.
+
+    Request:
+    {
+      "agent_type": "gestor",
+      "source": "tg:-100...:84",
+      "decisions": [
+        {
+          "topic": "VPS",
+          "name": "...",
+          "decision": "...",
+          "rationale": "...",
+          "summary": "...",
+          "status": "done",
+          "level": "infra",
+          "session_id": "ses_..."
+        }
+      ]
+    }
+    """
+    body = await request.json()
+    agent_type = (body.get('agent_type') or '').strip() or None
+    source = (body.get('source') or '').strip() or None
+    items = body.get('decisions') or body.get('items') or []
+
+    # propagate meta defaults
+    if isinstance(items, list):
+        for d in items:
+            if not isinstance(d, dict):
+                continue
+            if agent_type and not d.get('agent_type'):
+                d['agent_type'] = agent_type
+            if source and not d.get('source'):
+                d['source'] = source
+
+    result = upsert_decisions(items)
+    return JSONResponse(content=serialize_for_json(result))
 
 @app.post("/search")
 async def search(request: Request):
