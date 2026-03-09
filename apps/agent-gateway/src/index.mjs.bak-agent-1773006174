@@ -854,7 +854,6 @@ async function handleRespond(res, body) {
     replyLen: (final.text || '').length,
     stderrLen: (final.stderr || '').length,
     model: model || null,
-    agent: OPENCODE_AGENT_DEFAULT || null,
     secondPass,
   });
 

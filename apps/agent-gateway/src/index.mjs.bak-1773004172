@@ -414,16 +414,7 @@ function extractResult(events) {
   let text = '';
   for (const e of events) {
     if (!sessionID && e?.sessionID) sessionID = e.sessionID;
-    if (e?.type !== 'text') continue;
-
-    if (typeof e?.part?.text === 'string' && e.part.text) {
-      text += e.part.text;
-      continue;
-    }
-
-    if (typeof e?.text === 'string' && e.text) {
-      text += e.text;
-    }
+    if (e?.type === 'text' && e?.part?.text) text += e.part.text;
   }
   return { sessionID, text: text.trim() };
 }
@@ -854,7 +845,6 @@ async function handleRespond(res, body) {
     replyLen: (final.text || '').length,
     stderrLen: (final.stderr || '').length,
     model: model || null,
-    agent: OPENCODE_AGENT_DEFAULT || null,
     secondPass,
   });
 
