@@ -470,7 +470,9 @@ async function runHostMaintenanceRequest(request, { topicKey, chatId, threadId }
     '-o',
     'UserKnownHostsFile=/dev/null',
     HOST_MAINTENANCE_SSH_TARGET,
-    `bash -lc ${shellQuote(remoteCmd)}`,
+    'bash',
+    '-lc',
+    remoteCmd,
   ];
 
   const execResult = await runCmdCapture('ssh', sshArgs, { timeoutMs: HOST_MAINTENANCE_TIMEOUT_MS });

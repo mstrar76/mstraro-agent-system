@@ -7,17 +7,10 @@ import { autoBootOnStartup, checkAthenaHealth, searchGraphRAG } from './boot.mjs
 const PORT = Number(process.env.PORT || 8787);
 const OPENCODE_IMAGE = process.env.OPENCODE_IMAGE;
 const OPENCODE_MODEL_DEFAULT = process.env.OPENCODE_MODEL_DEFAULT || '';
-const OPENCODE_AGENT_DEFAULT = process.env.OPENCODE_AGENT_DEFAULT || 'gestor';
 const OPENCODE_WORKDIR = process.env.OPENCODE_WORKDIR || '/workspace';
 const OPENCODE_TIMEOUT_MS = Number(process.env.OPENCODE_TIMEOUT_MS || 90000);
 const SESSION_MAP_PATH = process.env.SESSION_MAP_PATH || '/data/session-map.json';
 const FILESET_DIR = process.env.FILESET_DIR || '/workspace/fileset';
-const HOST_WORKSPACE_ROOT = process.env.HOST_WORKSPACE_ROOT || '/home/concierge/agent-system/data/opencode/workspace';
-const HOST_MAINTENANCE_AGENT = process.env.HOST_MAINTENANCE_AGENT || 'maintenance-agent';
-const HOST_MAINTENANCE_RUNNER = process.env.HOST_MAINTENANCE_RUNNER || '/home/concierge/agent-system/bin/qwen-maintenance-host.sh';
-const HOST_MAINTENANCE_SSH_TARGET = process.env.HOST_MAINTENANCE_SSH_TARGET || 'concierge@host.docker.internal';
-const HOST_MAINTENANCE_SSH_KEY = process.env.HOST_MAINTENANCE_SSH_KEY || '/run/secrets/agent-gateway-host-ssh/id_ed25519';
-const HOST_MAINTENANCE_TIMEOUT_MS = Number(process.env.HOST_MAINTENANCE_TIMEOUT_MS || 600000);
 
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || '/workspace';
 const AGENTS_ROOT = process.env.AGENTS_ROOT || path.join(WORKSPACE_ROOT, 'agents');
@@ -130,6 +123,8 @@ function runCmdCapture(cmd, args, { timeoutMs = 2500 } = {}) {
     child.stderr.on('data', (c) => (stderr += c.toString('utf8')));
     child.on('close', (code) => {
       clearTimeout(timer);
+      try { fs.unlinkSync(cidFile); } catch { /* ignore */ }
+      try { fs.unlinkSync(cidFile); } catch { /* ignore */ }
       resolve({ ok: code === 0, code, stdout, stderr: (stderr || '').slice(0, 2000), timeout: false });
     });
     child.on('error', (e) => {
@@ -400,100 +395,6 @@ function getOpencodeConfigModel() {
   }
 }
 
-function shellQuote(value) {
-  return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
-}
-
-function resolveOpencodeAgent({ body, prevEntry }) {
-  const requested = String(body?.agent || '').trim();
-  if (requested) return requested;
-
-  const persisted = String(prevEntry?.opencodeAgent || '').trim();
-  if (persisted) return persisted;
-
-  return OPENCODE_AGENT_DEFAULT;
-}
-
-function parseHostMaintenanceRequest(text) {
-  const raw = String(text || '');
-  const match = raw.match(/<host_maintenance_request>\s*([\s\S]*?)<\/host_maintenance_request>/i);
-  if (!match) return null;
-
-  const body = String(match[1] || '').trim();
-  const workdir = (body.match(/^workdir:\s*(.+)$/im)?.[1] || '').trim() || '/home/concierge';
-  const risk = (body.match(/^risk:\s*(.+)$/im)?.[1] || '').trim() || 'unknown';
-  const approval = (body.match(/^approval:\s*(.+)$/im)?.[1] || '').trim() || 'required';
-  const promptMatch = body.match(/(^|\n)prompt:\s*([\s\S]*)$/i);
-  const prompt = String(promptMatch?.[2] || '').trim();
-
-  if (!prompt) return null;
-
-  return {
-    raw: match[0],
-    workdir,
-    risk,
-    approval,
-    prompt,
-  };
-}
-
-async function runHostMaintenanceRequest(request, { topicKey, chatId, threadId } = {}) {
-  if (!request?.prompt) {
-    return { ok: false, error: 'missing_prompt' };
-  }
-
-  if (!fs.existsSync(HOST_MAINTENANCE_SSH_KEY)) {
-    return { ok: false, error: `missing_ssh_key:${HOST_MAINTENANCE_SSH_KEY}` };
-  }
-
-  const reqId = `maint-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-  const runtimeDir = path.join(WORKSPACE_ROOT, '.runtime', 'maintenance-agent');
-  fs.mkdirSync(runtimeDir, { recursive: true });
-
-  const promptFile = path.join(runtimeDir, `${reqId}.prompt.txt`);
-  fs.writeFileSync(promptFile, request.prompt);
-
-  const hostPromptFile = promptFile.replace(WORKSPACE_ROOT, HOST_WORKSPACE_ROOT);
-  const remoteCmd = [
-    shellQuote(HOST_MAINTENANCE_RUNNER),
-    '--prompt-file',
-    shellQuote(hostPromptFile),
-    '--workdir',
-    shellQuote(request.workdir || '/home/concierge'),
-  ].join(' ');
-
-  const sshArgs = [
-    '-i',
-    HOST_MAINTENANCE_SSH_KEY,
-    '-o',
-    'StrictHostKeyChecking=no',
-    '-o',
-    'UserKnownHostsFile=/dev/null',
-    HOST_MAINTENANCE_SSH_TARGET,
-    `bash -lc ${shellQuote(remoteCmd)}`,
-  ];
-
-  const execResult = await runCmdCapture('ssh', sshArgs, { timeoutMs: HOST_MAINTENANCE_TIMEOUT_MS });
-  logEvent('maintenance_exec', {
-    topicKey: topicKey || null,
-    chatId: chatId || null,
-    threadId: threadId ?? null,
-    ok: execResult.ok,
-    code: execResult.code,
-    timeout: !!execResult.timeout,
-    risk: request.risk || null,
-    approval: request.approval || null,
-    workdir: request.workdir || null,
-  });
-
-  return {
-    ...execResult,
-    requestId: reqId,
-    promptFile,
-    hostPromptFile,
-  };
-}
-
 
 function parseJsonEvents(stdoutText) {
   const events = [];
@@ -661,7 +562,7 @@ ${lines.join('\n')}`;
   ];
 }
 
-function runOpencode({ sessionID, title, model, message, workdir, agent }) {
+function runOpencode({ sessionID, title, model, message, workdir }) {
   return new Promise((resolve) => {
     if (!OPENCODE_IMAGE) {
       resolve({ ok: false, code: -1, sessionID: null, text: '', stderr: 'Missing OPENCODE_IMAGE' });
@@ -671,7 +572,6 @@ function runOpencode({ sessionID, title, model, message, workdir, agent }) {
     const args = ['run', '--format', 'json'];
     if (title) args.push('--title', title);
     if (model) args.push('--model', model);
-    if (agent) args.push('--agent', agent);
     if (sessionID) args.push('--session', sessionID);
     args.push(message);
 
@@ -761,7 +661,6 @@ async function handleSessionNew(res, body) {
   const topicKey = String(body?.topicKey || 'General');
   const from = body?.from || {};
   const requestedModel = String(body?.model || OPENCODE_MODEL_DEFAULT || '').trim();
-  const requestedAgent = String(body?.agent || OPENCODE_AGENT_DEFAULT || '').trim();
 
   if (!chatId) {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -785,7 +684,7 @@ async function handleSessionNew(res, body) {
   ].join('\n');
 
   const t0 = Date.now();
-  const created = await runOpencode({ sessionID: null, title, model: requestedModel, message: initPrompt, workdir: agentWs.workdir, agent: requestedAgent });
+  const created = await runOpencode({ sessionID: null, title, model: requestedModel, message: initPrompt, workdir: agentWs.workdir });
   const newSessionID = created?.sessionID || null;
 
   logEvent('session_new', {
@@ -814,7 +713,6 @@ async function handleSessionNew(res, body) {
       threadId,
       topicKey,
       agentKey: agentWs.agentKey,
-      opencodeAgent: requestedAgent,
       workdir: agentWs.workdir,
       sessionID: newSessionID,
       history,
@@ -851,7 +749,6 @@ async function handleSessionSet(res, body) {
       threadId,
       topicKey: prev?.topicKey || String(body?.topicKey || 'General'),
       agentKey: prev?.agentKey || agentWs.agentKey,
-      opencodeAgent: prev?.opencodeAgent || String(body?.agent || OPENCODE_AGENT_DEFAULT || '').trim(),
       workdir: prev?.workdir || agentWs.workdir,
       sessionID,
       history,
@@ -898,7 +795,6 @@ async function handleRespond(res, body) {
   const key = `${chatId}:${threadId}`;
   const prevEntry = map.sessions[key] || null;
   let sessionID = prevEntry?.sessionID || null;
-  const selectedAgent = resolveOpencodeAgent({ body, prevEntry });
 
   const agentWs = ensureAgentWorkspace({ agentKey: prevEntry?.agentKey || body?.agentKey, topicKey });
 
@@ -922,7 +818,7 @@ async function handleRespond(res, body) {
   const message = finalPrompt;
 
   const t0 = Date.now();
-  const first = await runOpencode({ sessionID, title: sessionID ? null : title, model, message, workdir: agentWs.workdir, agent: selectedAgent });
+  const first = await runOpencode({ sessionID, title: sessionID ? null : title, model, message, workdir: agentWs.workdir });
   const sid = sessionID || first.sessionID || null;
   let final = first;
   let secondPass = false;
@@ -942,63 +838,8 @@ async function handleRespond(res, body) {
       userText,
     ].join('\n');
 
-    const second = await runOpencode({ sessionID: sid, title: null, model, message: followup, workdir: agentWs.workdir, agent: selectedAgent });
+    const second = await runOpencode({ sessionID: sid, title: null, model, message: followup, workdir: agentWs.workdir });
     if ((second.text || '').trim()) final = second;
-  }
-
-  if (sid && selectedAgent === HOST_MAINTENANCE_AGENT) {
-    const hostRequest = parseHostMaintenanceRequest(final.text);
-    if (hostRequest) {
-      const hostExec = await runHostMaintenanceRequest(hostRequest, { topicKey, chatId, threadId });
-      const evidence = [
-        '# Host maintenance result',
-        `- ok: ${hostExec.ok ? 'true' : 'false'}`,
-        `- code: ${hostExec.code ?? 'null'}`,
-        `- timeout: ${hostExec.timeout ? 'true' : 'false'}`,
-        `- workdir: ${hostRequest.workdir}`,
-        `- risk: ${hostRequest.risk}`,
-        `- approval: ${hostRequest.approval}`,
-        '',
-        '## stdout',
-        '```text',
-        String(hostExec.stdout || '').trim() || '(empty)',
-        '```',
-        '',
-        '## stderr',
-        '```text',
-        String(hostExec.stderr || '').trim() || '(empty)',
-        '```',
-      ].join('\n');
-
-      const validationPrompt = [
-        BASE_POLICY,
-        contextPrefix,
-        '# Host execution follow-up',
-        'The external host-side maintenance runner has finished.',
-        'Validate the evidence below and produce the final user-facing answer now.',
-        'Do not emit another <host_maintenance_request> block in this turn.',
-        '',
-        evidence,
-      ].join('\n');
-
-      const validated = await runOpencode({
-        sessionID: sid,
-        title: null,
-        model,
-        message: validationPrompt,
-        workdir: agentWs.workdir,
-        agent: selectedAgent,
-      });
-
-      if ((validated.text || '').trim()) {
-        final = validated;
-      } else {
-        final = {
-          ...hostExec,
-          text: `${final.text || ''}\n\n${evidence}`.trim(),
-        };
-      }
-    }
   }
 
   logEvent('respond', {
@@ -1013,7 +854,7 @@ async function handleRespond(res, body) {
     replyLen: (final.text || '').length,
     stderrLen: (final.stderr || '').length,
     model: model || null,
-    agent: selectedAgent || null,
+    agent: OPENCODE_AGENT_DEFAULT || null,
     secondPass,
   });
 
@@ -1031,7 +872,6 @@ async function handleRespond(res, body) {
       threadId,
       chatId,
       agentKey: prev?.agentKey || agentWs.agentKey,
-      opencodeAgent: prev?.opencodeAgent || selectedAgent,
       workdir: prev?.workdir || agentWs.workdir,
       history,
       createdAt: prev?.createdAt || now,
