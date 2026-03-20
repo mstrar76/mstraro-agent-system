@@ -13,17 +13,12 @@ echo "[$(date -Is)] auto-upgrade-stateless start"
 send_telegram() {
   local topic="${1:?topic}"
   local text="${2:?text}"
-  (cd /home/concierge/apps/telegram-gateway \
-    && docker compose exec -T \
-      -e TELEGRAM_SEND_TOPIC="$topic" \
-      -e TELEGRAM_SEND_TEXT="$text" \
-      telegram-gateway node scripts/send-message.mjs) >/dev/null || true
+  /home/concierge/agent-system/bin/send-telegram-openclaw.sh "$topic" "$text" >/dev/null || true
 }
 
 healthcheck() {
   local failures=0
 
-  docker ps --format "{{.Names}}" | grep -qx "agent_telegram_gateway" || failures=$((failures+1))
   docker ps --format "{{.Names}}" | grep -qx "agent_opencode" || failures=$((failures+1))
   docker ps --format "{{.Names}}" | grep -qx "agent_agent_gateway" || failures=$((failures+1))
 
@@ -38,16 +33,12 @@ with_lock() {
 }
 
 main() {
-  local before_tg before_oc
-  before_tg="$(docker inspect -f "{{.Image}}" agent_telegram_gateway 2>/dev/null || true)"
+  local before_oc
   before_oc="$(docker inspect -f "{{.Image}}" agent_opencode 2>/dev/null || true)"
 
-  echo "before: telegram=$before_tg opencode=$before_oc"
+  echo "before: opencode=$before_oc"
 
-  # Update allowlist (stateless): telegram-gateway + opencode + agent-gateway (restart/build)
-  echo "--- telegram-gateway pull+restart"
-  (cd /home/concierge/apps/telegram-gateway && docker compose pull && docker compose up -d)
-
+  # Update allowlist (stateless): opencode + agent-gateway (restart/build)
   echo "--- opencode pull+restart"
   (cd /home/concierge/apps/opencode && docker compose pull && docker compose up -d)
 
@@ -56,22 +47,17 @@ main() {
   (cd /home/concierge/apps/agent-gateway && docker compose build --pull && docker compose up -d)
 
   if healthcheck; then
-    local after_tg after_oc
-    after_tg="$(docker inspect -f "{{.Image}}" agent_telegram_gateway 2>/dev/null || true)"
+    local after_oc
     after_oc="$(docker inspect -f "{{.Image}}" agent_opencode 2>/dev/null || true)"
-    echo "after: telegram=$after_tg opencode=$after_oc"
+    echo "after: opencode=$after_oc"
 
-    send_telegram VPS "✅ Auto-upgrade (stateless) OK. telegram=${after_tg:0:12} opencode=${after_oc:0:12}"
+    send_telegram VPS "✅ Auto-upgrade (stateless) OK. opencode=${after_oc:0:12}"
     echo "[$(date -Is)] auto-upgrade-stateless ok"
     exit 0
   fi
 
   echo "healthcheck failed: attempting rollback"
   # Rollback best-effort for image-tag based services
-  if [[ -n "$before_tg" ]]; then
-    docker image tag "$before_tg" node:22-slim || true
-    (cd /home/concierge/apps/telegram-gateway && docker compose up -d) || true
-  fi
   if [[ -n "$before_oc" ]]; then
     docker image tag "$before_oc" openeuler/opencode:1.1.48-oe2403lts || true
     (cd /home/concierge/apps/opencode && docker compose up -d) || true

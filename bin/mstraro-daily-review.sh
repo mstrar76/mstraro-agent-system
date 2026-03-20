@@ -49,7 +49,8 @@ snippet() {
     echo "missing"
   fi
 
-  snippet /home/concierge/apps/telegram-gateway/docker-compose.yml 160
+  snippet /home/concierge/.openclaw/openclaw.json 260
+  snippet /home/concierge/.openclaw/workspace/CURRENT.md 120
   snippet /home/concierge/apps/agent-gateway/docker-compose.yml 220
   snippet /home/concierge/apps/opencode/docker-compose.yml 220
 
@@ -119,10 +120,7 @@ PY
 <<<"$reply")
 
 # send to telegram topic mstraro
-if [ -d /home/concierge/apps/telegram-gateway ]; then
-  cd /home/concierge/apps/telegram-gateway
-  docker compose exec -T \
-    -e TELEGRAM_SEND_TOPIC=mstraro \
-    -e TELEGRAM_SEND_TEXT="📋 Daily Review ($(date +%F))\n\n$reply_short" \
-    telegram-gateway node scripts/send-message.mjs >/dev/null 2>&1 || true
-fi
+/home/concierge/agent-system/bin/send-telegram-openclaw.sh \
+  mstraro \
+  "📋 Daily Review ($(date +%F))\n\n$reply_short" \
+  >/dev/null 2>&1 || true

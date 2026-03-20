@@ -13,11 +13,7 @@ echo "[$(date -Is)] git-snapshot start"
 send_telegram() {
   local topic="${1:?topic}"
   local text="${2:?text}"
-  (cd /home/concierge/apps/telegram-gateway \
-    && docker compose exec -T \
-      -e TELEGRAM_SEND_TOPIC="$topic" \
-      -e TELEGRAM_SEND_TEXT="$text" \
-      telegram-gateway node scripts/send-message.mjs) >/dev/null || true
+  /home/concierge/agent-system/bin/send-telegram-openclaw.sh "$topic" "$text" >/dev/null || true
 }
 
 with_lock() {

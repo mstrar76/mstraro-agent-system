@@ -108,7 +108,7 @@ function wantsRuntimeEvidence({ topicKey, userText }) {
   const tk = String(topicKey || '').trim().toLowerCase();
   if (tk === 'vps') return true;
   const t = String(userText || '');
-  return /(status|health|rodando|no ar|container|docker|compose|neo4j|telegram-gateway|agent-gateway|athena)/i.test(t);
+  return /(status|health|rodando|no ar|container|docker|compose|neo4j|agent-gateway|athena|openclaw)/i.test(t);
 }
 
 function runCmdCapture(cmd, args, { timeoutMs = 2500 } = {}) {
@@ -142,7 +142,7 @@ function runCmdCapture(cmd, args, { timeoutMs = 2500 } = {}) {
 async function getRuntimeEvidenceBlock({ topicKey, userText }) {
   if (!wantsRuntimeEvidence({ topicKey, userText })) return '';
 
-  const names = ['agent_telegram_gateway', 'agent_agent_gateway', 'agent_athena_mcp', 'agent_neo4j'];
+  const names = ['agent_agent_gateway', 'agent_athena_mcp', 'agent_neo4j'];
   const ps = await runCmdCapture('docker', ['ps', '--format', '{{.Names}}\t{{.Status}}'], { timeoutMs: 2500 });
   const lines = String(ps?.stdout || '')
     .split(/\r?\n/)
@@ -1055,7 +1055,7 @@ const server = http.createServer((req, res) => {
     res.end(
       JSON.stringify({
         ok: true,
-        runtime: 'vps-a/telegram-gateway -> agent-gateway -> opencode run',
+        runtime: 'vps-a/openclaw + agent-gateway -> opencode run',
         opencode: {
           image: OPENCODE_IMAGE || null,
           modelDefaultEnv: OPENCODE_MODEL_DEFAULT || null,

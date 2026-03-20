@@ -14,11 +14,7 @@ echo "[$(date -Is)] heartbeat start"
 send_telegram() {
   local topic="${1:?topic}"
   local text="${2:?text}"
-  (cd /home/concierge/apps/telegram-gateway \
-    && docker compose exec -T \
-      -e TELEGRAM_SEND_TOPIC="$topic" \
-      -e TELEGRAM_SEND_TEXT="$text" \
-      telegram-gateway node scripts/send-message.mjs) >/dev/null || true
+  /home/concierge/agent-system/bin/send-telegram-openclaw.sh "$topic" "$text" >/dev/null || true
 }
 
 json_get() {
@@ -68,7 +64,7 @@ with_lock() {
 
 check_containers() {
   local missing=()
-  for name in agent_telegram_gateway agent_agent_gateway agent_opencode; do
+  for name in agent_agent_gateway agent_opencode; do
     if ! docker ps --format "{{.Names}}" | grep -qx "$name"; then
       missing+=("$name")
     fi

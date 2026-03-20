@@ -47,11 +47,8 @@ trap 'rm -f "$LOCK"' EXIT
 } | tee -a "$LOG_FILE"
 
 # Notify Telegram (VPS topic)
-if [ -d /home/concierge/apps/telegram-gateway ]; then
-  cd /home/concierge/apps/telegram-gateway
-  summary=$(tail -n 35 "$LOG_FILE")
-  docker compose exec -T \
-    -e TELEGRAM_SEND_TOPIC=VPS \
-    -e TELEGRAM_SEND_TEXT="✅ VPS maintenance $(date +%F)\n\n$summary" \
-    telegram-gateway node scripts/send-message.mjs >/dev/null 2>&1 || true
-fi
+summary=$(tail -n 35 "$LOG_FILE")
+/home/concierge/agent-system/bin/send-telegram-openclaw.sh \
+  VPS \
+  "✅ VPS maintenance $(date +%F)\n\n$summary" \
+  >/dev/null 2>&1 || true
